@@ -1,0 +1,94 @@
+/**
+  ******************************************************************************
+  * @file    signal.h
+  * @brief   DAC + TIM6 + DMA 循环 → 持续正弦波，频率 20Hz~20kHz 可调（PA4 输出）
+  *
+  * 用法（main.c 的 USER CODE 区）：
+  *      Signal_Init();            // 放在 MX_DAC1_Init()/MX_TIM6_Init() 之后调一次
+  *      Signal_SetFreq(1000.0f);  // 随时改频率，单位 Hz
+  *
+  * 依赖（全部由 CubeMX 生成，勿手改）：
+  *      dac.c : hdac1 / hdma_dac1_ch1, DAC1_CH1, DAC_TRIGGER_T6_TRGO,
+  *              DMA1_Channel1 = Circular + Word + MemInc, PA4 = DAC1_OUT1
+  *      tim.c : htim6, TRGO = Update Event, AutoReloadPreload = ENABLE
+  *
+  * 注意：本工程 TIM6 时钟 = 170MHz（APB1 分频 = 1）。
+  *       若日后改主频，必须同步改 signal.c 里的 TIM6_CLK_HZ。
+  ******************************************************************************
+  */
+
+#ifndef __SIGNAL_H
+#define __SIGNAL_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdint.h>
+
+/* 正弦表最大点数（低频段用它换分辨率；内存占用 1024*4 = 4KB） */
+#define SIN_MAX_POINTS          1024U
+
+/* 输出频率范围 */
+#define SIGNAL_FREQ_MIN         20.0f
+#define SIGNAL_FREQ_MAX         100000.0f    /* 100kHz 是 DAC 物理上限附近，见下 */
+
+/*
+ * ★ 关于高频段的实测结论 ★
+ *   DAC 每次更新约需 1us，所以：
+ *     1k~20kHz  : 16~256 点/周期，波形漂亮
+ *     20k~50kHz : 8~16 点/周期，波形尚可
+ *     50k~100kHz: 4~8 点/周期，明显失真（趋近阶梯/方波）
+ *   这是 DAC 的物理极限，不是代码限制。
+ */
+
+/**
+  * @brief  启动正弦波输出，默认频率 1kHz
+  * @note   内部自动按目标频率选好 (PSC, ARR, 点数)，再依次启动
+  *         TIM6 → DAC → DMA(Circular)。调用一次即可。
+  */
+void            Signal_Init(void);
+
+/**
+  * @brief  设置输出频率（运行中随时可调）
+  * @param  freq_hz 目标频率 Hz，自动钳位到 [20, 20000]
+  * @note   换频时整条链路以正弦表首点（1.65V 过零点）重新同步，
+  *         所以不会跳相、不会出现半周期毛刺。耗时约几微秒。
+  */
+void            Signal_SetFreq(float freq_hz);
+
+/** @brief 取当前实际输出频率（已含 PSC/ARR 取整误差），单位 Hz */
+float           Signal_GetFreq(void);
+
+/** @brief 取当前使用的表点数（1024 / 512 / 256 / 64 / 32 / 16） */
+uint32_t        Signal_GetPoints(void);
+
+/** @brief 取正弦表首地址（RAM 表，运行时生成，32 位元素） */
+uint32_t       *Signal_GetTable(void);
+
+/**
+  * @brief  【临时诊断】测量真实采样率
+  * @note   用 1 秒窗口数 TIM6 的更新事件次数，精度约 0.1%。
+  *         在 main.c 里替代 Signal_Init() 调用，测完看 g_meas_* 变量。
+  *         实现见 signal_meas.c（诊断完可整个删掉）。
+  */
+void            Signal_Measure(void);
+
+/**
+  * @brief  【临时诊断】慢速正弦测试：5Hz/50Hz/1kHz 每 5 秒轮换
+  * @note   5Hz 周期 200ms，波形在示波器上"爬行"，肉眼可判定是完整正弦
+  *         还是半波/1/4 波。实现见 signal_slow.c（诊断完可删）。
+  */
+void            Signal_SlowTest(void);
+
+/**
+  * @brief  【临时诊断】带记录点的启动流程，把每步返回值写到 g_trace[]
+  * @note   跑完 g_trace_ready=1，用 J-Link 读 g_trace[0..15] 定位断点在哪一步。
+  */
+void            Signal_Trace(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __SIGNAL_H */
