@@ -181,8 +181,23 @@
 /* 李萨如图形模式：输出频率相对输入的倍频系数。
  *   1.0 = 斜线/圆发生（同频）
  *   2.0 = 无穷发生（x=sin(wt), y=sin(2wt)）
- * 相位仍由输入上升沿 Realign 到表头相位 0。 */
+ * 相位由对方过零触发 Realign 到表头相位 0。 */
 #define TRK_OUTPUT_FREQ_MULT  2.0f
+
+/* ★ 是否在"下降过零点"也复位相位 —— 只有 2 倍频（无穷图形）才该置 1。
+ *
+ *   为什么 2:1 必须两边都复位：
+ *     y = sin(2wt) 在 x = sin(wt) 的**两个**过零点上都恰好过零、且都是上升方向，
+ *     所以这两次复位在几何上都是正确的。而"半个输入周期 = 一个完整输出周期"
+ *     变成一个**整除关系** → 倍频被硬件锁死，图形完全静止。
+ *
+ *   为什么只把频率设成 2 倍锁不住（用户实测现象）：
+ *     设频率只能得到"大约 2 倍"。频率差哪怕只有 0.1%，每半个周期就残留
+ *     0.1% 个周期的相位差；由于只在上升沿归零，差值会累积一整周期才被清零，
+ *     于是图形看起来像无穷但**一直在缓慢旋转**，时域上相位角持续变化。
+ *   1 倍频时绝不能置 1：那时 sin(wt) 在对方下降过零点正处在相位 0.5，
+ *   在这里复位会把波形打断。 */
+#define TRK_REALIGN_BOTH_EDGES  1
 
 /* ============================== 开环测试模式 ==============================
  * ★★ 为什么需要这个开关：自监控闭环会失控 ★★
@@ -1159,6 +1174,7 @@ void ADC1_2_IRQHandler(void)
     {
         uint32_t now = DWT->CYCCNT;
         uint8_t  dir;
+        uint8_t  do_realign = 0U;
 
         ADC2->ISR = ADC_ISR_AWD1;               /* 写 1 清标志 */
         g_trk_awd_irq++;
@@ -1169,41 +1185,22 @@ void ADC1_2_IRQHandler(void)
         /* ⚠️ 每个分支都必须让"当前样本落在新窗口内"，否则 AWD 会连续触发成中断风暴 */
         if (dir == 1U)
         {
-            /* ---------- 确认上升穿越 → 唯一允许复位相位的时刻 ---------- */
+            /* ---------- 确认上升穿越 ---------- */
             trk_awd_window(s_awd_thr, 4095U);   /* 当前样本 ≥ thr，落在窗口内 ✓ */
             s_awd_arm_up = 0U;
-
-            {
-                uint32_t dt = now - s_last_realign_cyc;
-
-                /* 时间守卫：同一周期内不许复位两次（噪声在阈值附近连出两个上升穿越）。
-                 * 基准 = 相邻两次复位的间隔（≈ 输入周期），一阶低通跟着对方换频走。 */
-                if ((s_awd_ema > 0U) && (dt < ((s_awd_ema / 4U) * 3U)))
-                {
-                    g_trk_awd_glitch++;
-                }
-                else if (s_phaselock_on != 0U)
-                {
-                    Signal_Realign();           /* ★ 把输出相位硬拉回表头（相位0 = 上升沿）★ */
-                    g_trk_edges++;
-                    s_last_realign_cyc = now;
-
-                    if (s_awd_ema > 0U)
-                    {
-                        s_awd_ema = s_awd_ema - (s_awd_ema / 8U) + (dt / 8U);
-                    }
-                    else
-                    {
-                        s_awd_ema = dt;
-                    }
-                }
-            }
+            do_realign   = 1U;
         }
         else if (dir == 0U)
         {
-            /* ---------- 确认下降穿越 → 只重新武装，绝不复位相位 ---------- */
+            /* ---------- 确认下降穿越 ---------- */
             trk_awd_window(0U, s_awd_thr - 1U); /* 当前样本 < thr，落在窗口内 ✓ */
             s_awd_arm_up = 1U;
+#if TRK_REALIGN_BOTH_EDGES
+            /* ★ 2:1 无穷图形：对方下降过零点上也必须复位一次 ★
+             *   sin(2wt) 在这里同样恰好过零且上升，复位是正确的；
+             *   而且这样"半输入周期 = 一整个输出周期"成了整除关系，倍频被锁死。 */
+            do_realign   = 1U;
+#endif
         }
         else
         {
@@ -1234,6 +1231,34 @@ void ADC1_2_IRQHandler(void)
                 s_awd_arm_up = 1U;
             }
             g_trk_awd_glitch++;
+        }
+
+        /* ---------- 唯一允许复位相位的时刻 ---------- */
+        if (do_realign != 0U)
+        {
+            uint32_t dt = now - s_last_realign_cyc;
+
+            /* 时间守卫：相邻两次复位不可能比"基准的一半"还密
+             * （噪声在阈值附近连出两次穿越时就靠它挡住） */
+            if ((s_awd_ema > 0U) && (dt < (s_awd_ema / 2U)))
+            {
+                g_trk_awd_glitch++;
+            }
+            else if (s_phaselock_on != 0U)
+            {
+                Signal_Realign();           /* ★ 把输出相位硬拉回表头（相位0）★ */
+                g_trk_edges++;
+                s_last_realign_cyc = now;
+
+                if (s_awd_ema > 0U)
+                {
+                    s_awd_ema = s_awd_ema - (s_awd_ema / 8U) + (dt / 8U);
+                }
+                else
+                {
+                    s_awd_ema = dt;
+                }
+            }
         }
 
         s_last_awd_cyc = now;
