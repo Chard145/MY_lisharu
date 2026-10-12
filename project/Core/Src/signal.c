@@ -469,16 +469,23 @@ static void signal_apply(void)
      *      改动就永远生效不了。所以超过 SIGNAL_REALIGN_TIMEOUT_MS 就走正常流程立刻落地。 */
     if ((s_phaselock != 0U) && (s_running != 0U))
     {
-        if ((uint32_t)(HAL_GetTick() - s_last_realign_ms) < SIGNAL_REALIGN_TIMEOUT_MS)
+        /* ★ 锁相模式禁止超时后走下面的"停 TIM6 / 重启 DMA / CNT=0"兜底路径 ★
+         *
+         *   旧逻辑：超过 SIGNAL_REALIGN_TIMEOUT_MS 没收到 Realign，就认为输入断了，
+         *   直接落入下面的完整重启路径。问题是：AWD 可能只是暂时漏了一个沿、
+         *   或输入正在换频；此时主循环会在**任意相位**把 DMA 拉回表头，正是
+         *   用户看到的"下半沿走到一半跳成上半沿"。
+         *
+         *   锁相模式的第一原则是：**宁可参数晚一个 Realign 生效，也绝不能随机改相位**。
+         *   所以这里永远只在备用表上铺表，切换留给真正确认的上升沿；即使输入暂时
+         *   消失，也让当前输出连续自由运行，不再执行随机相位重启。 */
+        if (s_dirty != 0U)
         {
-            if (s_dirty != 0U)
-            {
-                /* ★ 在主循环里铺备用表：耗时 1ms，但输出照常跑，不受任何影响 ★ */
-                wave_fill_scratch(s_npts, s_phase_off);
-                s_dirty = 0U;
-            }
-            return;                     /* 切换留给 Signal_Realign() */
+            /* 在主循环铺备用表，DMA 仍播活动表，输出不冻结 */
+            wave_fill_scratch(s_npts, s_phase_off);
+            s_dirty = 0U;
         }
+        return;                         /* 永远不落入下面的随机重启路径 */
     }
 
     /* 0) ★ 动任何寄存器之前，先把"当前输出相位"取出来 ★

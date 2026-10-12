@@ -335,6 +335,7 @@ static uint32_t s_awd_ema;          /* ★ 相邻 AWD 事件间隔的滑动平�
                                      *   **故意用事件自身的间隔而不是主循环给的周期** ——
                                      *   对方换频时主循环那个值会过期，守卫就会误判"漏沿"而错误翻转奇偶性。 */
 static uint32_t s_awd_rearm_cyc;    /* ★ 上次重写 AWD 窗口的时刻，用来界定"改写引出的事件"的时间窗 */
+static uint32_t s_last_realign_cyc; /* ★ 上次真正复位相位的时刻，时间守卫用（相邻复位间隔 ≈ 输入周期） */
 
 /* 重写窗口后多久以内到来的 AWD 事件算"改写引出的假边沿"（170MHz × 30us）。
  * 取 30us：ADC 采样周期 2us + AWDFILT 两次 + 中断响应，满打满算不到 8us，
@@ -1061,129 +1062,171 @@ static void trk_awd_force(uint32_t thr)
 }
 
 /**
+  * @brief  ★ 看最近几个真实 ADC 样本，判定"最近一次穿越阈值"的方向 ★
+  *
+  * ============ 为什么必须这样做（这才是"下半沿跳上半沿"的真正根因）============
+  *
+  *   AWD 硬件只给出一个布尔量："这个样本在窗口外"。**它完全没有方向信息。**
+  *   原先的代码靠一个状态变量交替翻转来猜方向：
+  *         arm_up=1 → 这次算上升沿（复位相位）
+  *         arm_up=0 → 这次算下降沿（不复位）
+  *   这个推断有个致命弱点：**只要多来一个假事件、或少来一个真事件，奇偶性就永久反掉**。
+  *   从此每个"上升沿"都落在真正的下降沿上 → 输出在下降半周被硬拉回表头
+  *   → 示波器上就是「下半沿走到一半直接跳成上半沿」，而且**一直错到下一次抖动**。
+  *   （用户原话："部分下半沿直接跳转为上半沿" —— 完全对上。）
+  *
+  *   任何"事后纠正奇偶性"的做法都只是打补丁。正解是**根本不去猜**：
+  *   ADC 的 DMA 缓冲区里就躺着真实的样本序列，方向是直接可读的。
+  *
+  *   ★ 安全性：DMA 正在写的下标是 idx，本函数只读 idx-1 … idx-9 —— 全是已经写完的样本，
+  *     而且要 4ms 后 DMA 才会绕回来覆盖，绝对安全（不会读到"半新半旧"的样本）。
+  *
+  *   ★ 顺带一次性解决两个老问题：
+  *     · 主循环重写 AWD 窗口后，新窗口可能立刻把当前样本判成"出界"而凭空造出一次事件 ——
+  *       这种假事件往回扫 8 个样本**找不到任何穿越**（真正的沿在半个周期以前）→ 方向不明
+  *       → 不复位相位。**结构上不可能再引发跳相。**
+  *     · 阈值附近抖动造成的重复事件同理，最多判成"方向不明"，绝不会被当成上升沿。
+  *
+  * @retval 1 = 确认上升穿越（低→高）；0 = 确认下降穿越（高→低）；0xFF = 判不出
+  */
+static uint8_t trk_awd_dir(void)
+{
+    const uint16_t *buf = Adc_Vofa_BufBase();
+    uint32_t idx;
+    uint32_t k;
+    int32_t  thr = (int32_t)s_awd_thr;
+
+    if (buf == NULL)
+    {
+        return 0xFFU;
+    }
+
+    /* 下一个待写下标 = ADC_BUF_LEN - CNDTR；最新已完成的样本是它的前一个。
+     * CNDTR 刚回绕到 0 时 idx 会等于 ADC_BUF_LEN，夹到 0（取模后正好指向缓冲区末尾）✓ */
+    idx = (uint32_t)ADC_BUF_LEN - (DMA1_Channel4->CNDTR & 0xFFFFU);
+    if (idx >= (uint32_t)ADC_BUF_LEN)
+    {
+        idx = 0U;
+    }
+
+    /* 从最新往回扫，第一个跨过阈值的相邻样本对就是"最近一次穿越"。
+     * 只看 8 个样本：AWDFILT 两次 + 中断响应最多占 4~6 个；
+     * 再往前就会越过真正的沿、误判成上一次穿越了。 */
+    for (k = 1U; k <= 8U; k++)
+    {
+        int32_t cur = (int32_t)buf[(idx + (uint32_t)ADC_BUF_LEN - k) % (uint32_t)ADC_BUF_LEN];
+        int32_t prv = (int32_t)buf[(idx + (uint32_t)ADC_BUF_LEN - k - 1U) % (uint32_t)ADC_BUF_LEN];
+
+        if ((prv < thr) && (cur >= thr))
+        {
+            return 1U;                  /* 低 → 高：确认上升穿越 */
+        }
+        if ((prv >= thr) && (cur < thr))
+        {
+            return 0U;                  /* 高 → 低：确认下降穿越 */
+        }
+    }
+    return 0xFFU;                       /* 8 个样本内没有穿越 → 方向不明 */
+}
+
+/**
   * @brief  ★ 相位对齐的执行点 ★ ADC 模拟看门狗中断
   * @note   中断里只做寄存器操作（不重铺表），耗时约 1~2us。
   *
-  * ============================ ★★★ 时间守卫 ★★★ ============================
+  * ★★★ 核心原则（这是本次彻底修好的关键）★★★
+  *   **AWD 窗口只用来决定"下一次中断什么时候来"，绝不用来推断方向。
+  *     方向一律由 trk_awd_dir() 从真实样本里读。**
   *
-  *   这是"李萨如图形时不时跳到中心对称位置并停住"的真正根因所在。
-  *
-  *   【现象】示波器 XY 模式下，输出相对输入是一个稳定的椭圆，偶尔**跳到它中心对称的
-  *           那个椭圆，并且停在那里**，过一会儿又跳回来。频率始终完全正确。
-  *
-  *   【机理】XY 下的中心对称 = 相位差了 180° = **我们复位到了对方的下降沿**。
-  *           而 AWD 只有一个"谁在窗口外"的布尔信息，方向完全靠状态机**交替翻转**推断：
-  *                 arm_up=1 → 这次算上升沿（复位相位，arm_up 变 0）
-  *                 arm_up=0 → 这次算下降沿（只翻窗口，不复位）
-  *           所以只要**多来一个假事件**（阈值附近抖动、或主循环改窗口引出的伪过零），
-  *           奇偶性就永久反掉：从此每一次"上升沿"都落在真正的下降沿上 → 输出差 180°，
-  *           并且**一直错下去**，直到再抖一次把它翻回来 —— 正是"跳过去、停住、又跳回来"。
-  *           N=1 的假事件概率不高，所以每秒才跳一两次，看着像"偶发"。
-  *
-  *   【修法】用一个状态机免费的独立信息：**真过零之间必定相隔半个周期**。
-  *           · 间隔远小于半周期 → 这条是假事件：**整条丢进垃圾桶**
-  *             （不是"翻状态但不对齐"—— 那样奇偶性照样被带偏，必须整条忽略）
-  *           · 间隔约等于 k 个半周期（k≥2）→ 中间漏了 k-1 个真沿：
-  *             把奇偶性补回来（k-1 为奇数就多翻一次）
-  *
-  *           两个守卫合起来让状态机**自校正**：错也只错到下一个沿，不会再永久停住。
+  *   于是：无论窗口状态怎么错、无论多来还是少来多少次中断，
+  *   都不可能再把下降沿当成上升沿 → 输出永远不会在下降半周被拉回表头
+  *   → "下半沿跳上半沿"从**结构上**消失，而不是靠概率去躲。
   */
 void ADC1_2_IRQHandler(void)
 {
     if ((ADC2->ISR & ADC_ISR_AWD1) != 0U)
     {
         uint32_t now = DWT->CYCCNT;
-        uint32_t dt  = now - s_last_awd_cyc;
-        uint8_t  first = (s_awd_have_cyc == 0U) ? 1U : 0U;   /* 开机以来的第一条事件 */
-        uint8_t  up;
+        uint8_t  dir;
 
         ADC2->ISR = ADC_ISR_AWD1;               /* 写 1 清标志 */
         g_trk_awd_irq++;
 
-        /* ---- 守卫⓪：基准还没建立（开机第一条 / 刚发生过离谱间隔）→ 只记时间 ---- */
-        if (s_awd_have_cyc == 0U)
+        /* ★ 方向来自真实样本，不来自状态机 ★ */
+        dir = trk_awd_dir();
+
+        /* ⚠️ 每个分支都必须让"当前样本落在新窗口内"，否则 AWD 会连续触发成中断风暴 */
+        if (dir == 1U)
         {
-            s_awd_have_cyc = 1U;
+            /* ---------- 确认上升穿越 → 唯一允许复位相位的时刻 ---------- */
+            trk_awd_window(s_awd_thr, 4095U);   /* 当前样本 ≥ thr，落在窗口内 ✓ */
+            s_awd_arm_up = 0U;
+
+            {
+                uint32_t dt = now - s_last_realign_cyc;
+
+                /* 时间守卫：同一周期内不许复位两次（噪声在阈值附近连出两个上升穿越）。
+                 * 基准 = 相邻两次复位的间隔（≈ 输入周期），一阶低通跟着对方换频走。 */
+                if ((s_awd_ema > 0U) && (dt < ((s_awd_ema / 4U) * 3U)))
+                {
+                    g_trk_awd_glitch++;
+                }
+                else if (s_phaselock_on != 0U)
+                {
+                    Signal_Realign();           /* ★ 把输出相位硬拉回表头（相位0 = 上升沿）★ */
+                    g_trk_edges++;
+                    s_last_realign_cyc = now;
+
+                    if (s_awd_ema > 0U)
+                    {
+                        s_awd_ema = s_awd_ema - (s_awd_ema / 8U) + (dt / 8U);
+                    }
+                    else
+                    {
+                        s_awd_ema = dt;
+                    }
+                }
+            }
         }
-        else if (s_awd_ema == 0U)
+        else if (dir == 0U)
         {
-            s_awd_ema = dt;                     /* 用第一条真实间隔当基准 */
+            /* ---------- 确认下降穿越 → 只重新武装，绝不复位相位 ---------- */
+            trk_awd_window(0U, s_awd_thr - 1U); /* 当前样本 < thr，落在窗口内 ✓ */
+            s_awd_arm_up = 1U;
         }
         else
         {
-            /* 相邻事件间隔 ÷ 基准 = 过了多少个半周期（四舍五入） */
-            uint32_t n = (dt + (s_awd_ema / 2U)) / s_awd_ema;
+            /* ---------- 方向不明（改窗口引出的假事件 / 阈值附近抖动）----------
+             * 按"最新一个样本在哪一侧"选窗口，保证当前样本一定在窗内，
+             * 否则会立刻再触发一次 → 中断风暴。**绝不复位相位。** */
+            const uint16_t *buf = Adc_Vofa_BufBase();
+            uint32_t idx = (uint32_t)ADC_BUF_LEN - (DMA1_Channel4->CNDTR & 0xFFFFU);
+            int32_t  last = (int32_t)s_awd_thr;
 
-            /* ---- 守卫①：太早 → 假事件，**整条丢弃**（状态都不翻，奇偶性必须保住）---- */
-            if (n == 0U)
+            if (idx >= (uint32_t)ADC_BUF_LEN)
             {
-                g_trk_awd_glitch++;
-                return;                         /* 注意：不更新 s_last_awd_cyc */
+                idx = 0U;
+            }
+            if (buf != NULL)
+            {
+                last = (int32_t)buf[(idx + (uint32_t)ADC_BUF_LEN - 1U) % (uint32_t)ADC_BUF_LEN];
             }
 
-            /* ---- 守卫②：太晚 → 中间漏了真沿，把奇偶性补回来 ---- */
-            if (n > 1U)
+            if (last >= (int32_t)s_awd_thr)
             {
-                if (n <= 6U)
-                {
-                    if (((n - 1U) & 1U) != 0U)
-                    {
-                        s_awd_arm_up = (uint8_t)(s_awd_arm_up ^ 1U);
-                        g_trk_awd_flip++;
-                    }
-                    g_trk_awd_miss++;
-                }
-                else
-                {
-                    /* 隔了太久（信号刚接上/刚换频），状态已不可信，按当前电平重定 */
-                    s_awd_arm_up = (s_prev > (int32_t)s_awd_thr) ? 0U : 1U;
-                    g_trk_awd_flip++;
-                }
-                s_awd_ema = dt;                 /* 大间隔后用新间隔重建基准 */
+                trk_awd_window(s_awd_thr, 4095U);
+                s_awd_arm_up = 0U;
             }
             else
             {
-                /* 正常：只让"正常间隔"参与基准，避免被异常值带偏。
-                 * 一阶低通（1/8）跟得上换频，又不会被单次抖动带跑。 */
-                s_awd_ema = s_awd_ema - (s_awd_ema / 8U) + (dt / 8U);
+                trk_awd_window(0U, s_awd_thr - 1U);
+                s_awd_arm_up = 1U;
             }
+            g_trk_awd_glitch++;
         }
 
         s_last_awd_cyc = now;
         s_awd_have_cyc = 1U;
-        up = s_awd_arm_up;
-
-        if (up != 0U)
-        {
-            /* 刚才是"样本 ≥ thr" → 上升沿 */
-            trk_awd_window(s_awd_thr, 4095U);   /* 转去等下降沿 */
-            s_awd_arm_up = 0U;
-
-            if ((first != 0U) ||
-                ((s_awd_skip != 0U) && ((now - s_awd_rearm_cyc) < TRK_AWD_REARM_GRACE_CYC)))
-            {
-                /* ★ 这次事件的方向不可信 ★
-                 *   · first  ：开机第一条 —— 此刻信号可能停在高电平，状态机却以为在等上升沿；
-                 *   · 时间窗 ：刚重写过窗口，新窗口可能立刻把当前样本判成"出界"，
-                 *              凭空造出一个假过零（见 trk_awd_set_thr 坑 C）。
-                 *   两种都只翻状态、**绝不复位相位**。翻完之后窗口与当前电平自洽，
-                 *   后面的沿就都是真的了。 */
-                s_awd_skip = 0U;
-                g_trk_awd_skip++;
-            }
-            else if (s_phaselock_on != 0U)
-            {
-                Signal_Realign();               /* ★ 把输出相位硬拉回上升沿 ★ */
-                g_trk_edges++;
-            }
-        }
-        else
-        {
-            /* 刚才是"样本 < thr" → 下降沿，只翻窗口，别的什么都不做 */
-            s_awd_arm_up = 1U;
-            trk_awd_window(0U, s_awd_thr - 1U);
-            s_awd_skip = 0U;    /* 下降沿不作相位依据，标记就此清掉 */
-        }
+        s_awd_skip = 0U;
     }
 }
 
