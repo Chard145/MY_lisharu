@@ -388,7 +388,70 @@ AWD 是 ADC 内部的硬件比较器，每次转换完把结果和 `[LT1, HT1]` 
   DAC 触发源，代价大收益小。
 - 方波测频时线性插值把沿定位在两个样本中点，但这是**恒定偏差**，首尾相减时自动抵消。
 
-## 7. 相关技能
+## 7. 李萨如图形版本（三个标签，可互相切换）
+
+| 标签 | 提交 | 图形 | 关键参数 |
+|---|---|---|---|
+| `斜线发生` | `dde8b2e` | 斜线/同相 | `TRK_OUTPUT_FREQ_MULT 1`、`TRK_REALIGN_BOTH_EDGES 0`、相位 0° |
+| `圆发生` | `a20d13d` | 正圆 | 同上 + `Signal_SetPhaseDeg(90.0f)` |
+| `无穷发生` | `091f1a7` | 2:1 无穷 | `TRK_OUTPUT_FREQ_MULT 2.0f`、`TRK_REALIGN_BOTH_EDGES 1`、相位 0° |
+
+**切换版本**（切完必须重新构建+烧录）：
+
+```powershell
+git switch --detach 圆发生          # 或 斜线发生 / 无穷发生
+cmake --build "C:\Users\chard\Desktop\MY_lisharu\project\build\Debug"
+JLink.exe -CommanderScript flash.jlink    # 烧录前先关 RTT 桥
+```
+
+> ⚠️ `斜线发生`/`圆发生` 两个标签**早于** CMake 自动生成 HEX 的修正，
+> 检出这两个标签后构建**不会**自动产出 `build\Debug\project.hex`，
+> 需要手动补一句 `arm-none-eabi-objcopy -O ihex build\Debug\project.elf build\Debug\project.hex`。
+> `无穷发生` 及之后不需要。
+
+**做圆形李萨如的完整条件**（少一条就是椭圆）：
+同频 + 相位差 90° + 输入输出 Vpp 相等 + 示波器两个通道 V/div 相同。
+
+### ★ 多倍频李萨如：倍频必须"整除锁死"，不能靠设频率（2026-10-12）
+
+用户报：输出设成输入的 2 倍，得到的是"类似无穷的圆环，视觉上在持续循环而不是静止"，
+时域看相位角一直在变。
+
+**根因**：设频率只能得到"**大约** 2 倍"。频率差哪怕只有 0.1%，每个输入周期就残留
+0.1% 个周期的相位差；而复位只在上升沿发生，差值要累积整整一个周期才被清零 →
+图形看着像无穷但一直在缓慢旋转。
+**而且 `sin(2ωt)` 在 `sin(ωt)` 的两个过零点上都恰好过零且上升**，
+只在上升沿复位等于白白丢掉一半的锁定机会。
+
+**修法**：`TRK_OUTPUT_FREQ_MULT` 设 2.0 之外，还要 `TRK_REALIGN_BOTH_EDGES 1`
+—— **上升沿和下降沿都复位相位**。这样"半个输入周期 = 一整个输出周期"成了
+**整除关系**，倍频被硬件锁死，完全不依赖频率设置精度。
+实测：输入 797.38~797.93Hz，输出恒定 1596.30Hz，比值 **2.0013**。
+
+★ 1 倍频（斜线/圆）**必须**把 `TRK_REALIGN_BOTH_EDGES` 置 0：
+那时 `sin(ωt)` 在对方下降过零点正处在相位 0.5，在那里复位会把波形打断。
+
+★ 走过的弯路（已撤）：想用 `CNDTR = 表长 × 2` 让一个输入周期播两张表。
+**不行** —— DMA 是循环模式，读第二个周期时会**越过表尾**
+（`wave_fill_n` 只填了前 N 点），后半段播的是垃圾数据。锁倍频要用双边沿复位。
+
+### ★★ 烧录必须核对"编译产物"和"烧录输入"是同一个文件（2026-10-12 血泪）★★
+
+**踩的坑**：objcopy 一直写 `project.hex`（工程根目录），
+而 `flash.jlink` 读的是 `build\Debug\project.hex`。结果**改了代码、编译成功、
+烧录也报 O.K.，板上跑的却是几小时前的旧固件**。
+一度拿新 ELF 的符号地址去解释旧固件的内存，把约 997Hz 的正常计数
+误判成"AWD 冻结"，白查很久。
+
+**修法**：`CMakeLists.txt` 里加 `add_custom_command(... POST_BUILD ...)`，
+每次链接后**自动**生成 `build\Debug\project.hex`（和 `project.bin`）。
+以后不要再手动 objcopy 到别处。
+
+**通用判据**：烧录前比对两边的 SHA256；或直接看 mtime ——
+`build\Debug\project.hex` 必须和 `project.elf` 同一时刻。
+`project.hex`（根目录）已作废，不要再生成。
+
+
 
 - `jlink-rtt-bridge` —— RTT / J-Scope / VOFA+ 传数据的完整用法与本机现场记忆。
 - `scope-sds1052a` —— 示波器读数（LeCroy 老式命令集，不是标准 SCPI）。
