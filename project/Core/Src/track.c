@@ -122,7 +122,20 @@
 /* 电平/波形参数只在变化超过这些阈值时才真正写进 signal.c ——
  * 因为每次写都可能触发重铺表（0.5ms 冻结输出），不能让它跟着包络抖动乱写。 */
 #define TRK_LEVEL_EPS       16U      /* 电平码值变化超过 16 才更新 */
-#define TRK_DUTY_EPS        0.01f    /* 占空比变化超过 1% 才更新 */
+#define TRK_DUTY_EPS        0.03f    /* 占空比变化超过 3% 才更新 */
+
+/* ★★ 慢变量的更新节流（2026-10-12 加，这是"丢样本→频率算错"的最后一环）★★
+ *
+ *   波形类型 / 电平 / 占空比都是**慢变量**，但每写一次都可能触发重铺整张表
+ *   （1024 次 sinf() ≈ 0.5~1ms，期间 TIM6 停着、输出被冻结）。
+ *   实测踩到：占空比估计在 47%~52% 之间抖（真值约 50%），
+ *   每次都超过 TRK_DUTY_EPS → 每秒触发几十次重铺 →
+ *   主循环单次超过 4.1ms → DMA 套圈丢样本 → s_total 落后 → 频率算错。
+ *   现象是 g_trk_laps 从 0 涨到 21.8/s。
+ *
+ *   所以这里硬性限速：最快每 TRK_PARAM_MIN_MS 毫秒才允许写一次。
+ *   代价是"对方幅度/占空比变了"最多延迟 250ms 才跟上 —— 完全可以接受。 */
+#define TRK_PARAM_MIN_MS    250U
 
 /* ============================== 开环测试模式 ==============================
  * ★★ 为什么需要这个开关：自监控闭环会失控 ★★
@@ -166,6 +179,7 @@ volatile uint32_t g_trk_sq_ratio = 0U;   /* 贴轨样本比例 ×1000（方波�
 volatile uint32_t g_trk_duty_ppm = 0U;   /* 对方方波占空比，单位 ppm */
 volatile uint32_t g_trk_vmin     = 0U;   /* 对方低电平码值（直接搬给 DAC 用） */
 volatile uint32_t g_trk_vmax     = 0U;   /* 对方高电平码值 */
+volatile uint32_t g_trk_laps     = 0U;   /* ★ 因主循环太慢而丢掉整圈样本的次数（应该一直是 0）*/
 
 /* ============================== 内部状态 ============================== */
 
@@ -199,6 +213,53 @@ static uint32_t s_last_upd_ms;      /* 上次 SetFreq 的时刻 */
 static uint32_t s_lo_rail;          /* 当前统计窗里贴**下轨**的样本数 */
 static uint32_t s_hi_rail;          /* 当前统计窗里贴**上轨**的样本数 */
 static uint32_t s_win_cnt;          /* 当前统计窗里的总样本数 */
+
+/* ★ 每周期极值 —— "稳定电平"（2026-10-12 加，修"电平抖动疯狂重铺表"的 bug）★
+ *
+ *   为什么不能直接拿 s_env_min/s_env_max 当输出电平：
+ *   包络是"快攻慢放"的（每 TRK_ENV_PERIOD 个样本两端各朝中间收 1 码），
+ *   它在一个信号周期内会漂移好几个百分点，然后被下一周期的真极值复位 ——
+ *   也就是一条锯齿波。而 trk_apply_waveform() 的更新判据是
+ *   "变化 > TRK_LEVEL_EPS 码"，于是**每次测量都判定成"变了"**，
+ *   每秒调 170 次 Signal_SetLevels() → 每次都重铺整张表
+ *   （1024 次 sinf() ≈ 0.5~1ms，期间 TIM6 停着、输出冻结）。
+ *   实测后果：主循环被拖慢 → DMA 绕圈丢样本 → s_total 比真实时间走得慢
+ *   → f = (沿数-1)*fs/span 里的 span 偏小 → 频率偏高，
+ *   实际观察到在 156Hz 和 310Hz 之间来回跳（约 2 倍）。
+ *
+ *   改法：输出电平取"相邻两个上升沿之间的真实 min/max"，这是**稳定**的，
+ *   只有对方幅度真的变了才会动。包络仍然保留，给 dc/hyst/valid 用
+ *   （它必须会衰减，才能检测出"信号没了"）。 */
+static int32_t  s_per_min;          /* 本周期内（自上个上升沿起）的最小值 */
+static int32_t  s_per_max;          /* 本周期内的最大值 */
+static uint8_t  s_lvl_valid;        /* 下面的"稳定电平"是否已建立 */
+static uint32_t s_lvl_min;          /* 稳定的低电平码值（给 Signal_SetLevels 用） */
+static uint32_t s_lvl_max;          /* 稳定的高电平码值 */
+
+/* DMA 绕圈检测：主循环太慢时 DMA 会整整绕一圈，样本就被丢掉了，
+ * 这时 s_total 与实际时间不再对应，必须清空过零历史重新开始，
+ * 否则算出来的频率是错的（这个计数器用来观察发生了多少次）。 */
+static uint32_t s_last_fill;        /* 上次 poll 时 DMA 的写入位置 */
+static uint8_t  s_fill_valid;
+static uint32_t s_cyc_base;         /* 起始 CPU 周期数（DWT），用作采样时间基准的零点 */
+
+/* ★ 时间基准用 CPU 周期数，不要用"数 DMA 绕了几圈"（2026-10-12 踩坑）★
+ *
+ *   TIM7 是 ARR=339，也就是每 **340** 个 170MHz 周期触发一次 ADC 转换。
+ *   而 CPU 和 TIM7 同一个 170MHz 时钟，所以
+ *
+ *       从 Init 到现在"应该已经采了多少样本"  =  (DWT->CYCCNT - s_cyc_base) / 340
+ *
+ *   这个数是**精确**的，与主循环快慢完全无关，也不可能漏数。
+ *
+ *   之前写成"观察 fill 变小就 s_wraps++"来累计写入量，有个致命漏洞：
+ *   如果两次 poll 之间 DMA 走了**一整圈还多一点**（2048+k 个样本），
+ *   fill 结束时反而比上次**大**，绕圈就看不见了 → 凭空少算 2048 个样本
+ *   → s_total 落后于真实时间 → f=(沿数-1)*fs/span 里的 span 偏小 → **频率偏高**。
+ *   实测现象：真正的输入是 158Hz（g_trk_edges 速率 158/s 是对的），
+ *   算出来却是 205~241Hz，而且 samples 速率只有 365k/s（应该是 500k/s）。
+ */
+#define TRK_CYC_PER_SAMPLE  340U
 static uint32_t s_hi_cnt;           /* 自上个上升沿以来大于 dc 的样本数 */
 static uint32_t s_lo_cnt;           /* 自上个上升沿以来小于 dc 的样本数 */
 static uint8_t  s_duty_done;        /* 占空比是否已经测到过一次 */
@@ -210,6 +271,7 @@ static uint32_t s_awd_thr = 2048U;  /* AWD 阈值 = 对方波形的直流中点�
 static uint8_t  s_phaselock_on;     /* 1 = 允许 AWD 中断去复位输出相位（有有效信号时才开） */
 
 static uint8_t  s_app_valid;        /* 下面几个"已经写进 signal.c 的值"是否有效 */
+static uint32_t s_param_ms;         /* 上次写慢变量（波形/电平/占空比）的时刻，用于节流 */
 static uint32_t s_app_vmin;
 static uint32_t s_app_vmax;
 static uint8_t  s_app_wave = 0xFFU;
@@ -301,6 +363,7 @@ static void trk_env_update(void)
         g_trk_valid = 0U;
         s_phaselock_on = 0U;            /* ★ 没信号时禁止 AWD 中断复位相位 ★
                                          *   否则阈值附近的噪声会不停地把输出波形打断成碎片。 */
+        s_lvl_valid = 0U;               /* 稳定电平也作废，等信号回来重新量 */
         trk_clear_meas();
         return;
     }
@@ -325,8 +388,11 @@ static void trk_env_update(void)
         }
     }
 
-    /* AWD 的阈值就跟这个直流中点走，对方信号偏置变了也能自己跟上 */
-    trk_awd_set_thr((uint32_t)s_dc);
+    /* AWD 的阈值取"稳定电平"的中点，比会衰减的 s_dc 更稳，
+     * 阈值不抖 → AWD 不会在阈值附近反复触发。还没量够一个周期时退回 s_dc。 */
+    trk_awd_set_thr((s_lvl_valid != 0U)
+                    ? ((s_lvl_min + s_lvl_max) / 2U)
+                    : (uint32_t)s_dc);
 
     g_trk_valid    = 1U;
     s_phaselock_on = 1U;                /* 确认有有效信号了，才允许 AWD 中断复位输出相位 */
@@ -466,6 +532,10 @@ static void trk_feed(uint32_t g, uint16_t raw)
      *   被误判成"没信号"。详见 trk_env_update() 的说明。 */
     if (v < s_env_min) { s_env_min = v; }
     if (v > s_env_max) { s_env_max = v; }
+
+    /* ---- 每周期极值：给"稳定电平"用（和上面会衰减的包络是两回事）---- */
+    if (v < s_per_min) { s_per_min = v; }
+    if (v > s_per_max) { s_per_max = v; }
 
     s_env_cnt++;
     if (s_env_cnt >= TRK_ENV_PERIOD)
@@ -698,6 +768,33 @@ static void trk_duty_update(void)
 
     s_hi_cnt = 0U;
     s_lo_cnt = 0U;
+
+    /* ---- 顺手结算本周期的真实极值 → 稳定的输出电平 ----
+     * 这一步是修"电平抖动导致每秒重铺 170 次表"的关键，详见 s_per_min 的说明。 */
+    if ((s_per_max - s_per_min) >= TRK_MIN_PK)
+    {
+        uint32_t lo = (s_per_min > 0) ? (uint32_t)s_per_min : 0U;
+        uint32_t hi = (s_per_max > 0) ? (uint32_t)s_per_max : 0U;
+
+        if (s_lvl_valid == 0U)
+        {
+            s_lvl_min   = lo;
+            s_lvl_max   = hi;
+            s_lvl_valid = 1U;
+        }
+        else
+        {
+            /* 一阶低通（系数 1/2）：抗单周期毛刺，
+             * 对方幅度真的变了 2~3 个周期内就跟上。 */
+            s_lvl_min = (uint32_t)(((int32_t)s_lvl_min + (int32_t)lo) / 2);
+            s_lvl_max = (uint32_t)(((int32_t)s_lvl_max + (int32_t)hi) / 2);
+        }
+        g_trk_vmin = s_lvl_min;
+        g_trk_vmax = s_lvl_max;
+    }
+
+    s_per_min = 4095;
+    s_per_max = 0;
 }
 
 /**
@@ -721,10 +818,25 @@ static void trk_wave_detect(void)
         uint32_t r_hi = (s_hi_rail * 1000U) / s_win_cnt;
         uint32_t r    = (r_lo < r_hi) ? r_lo : r_hi;
 
-        g_trk_sq_ratio  = r;
-        s_detected_wave = (r >= (uint32_t)(TRK_SQUARE_RATIO * 1000.0f))
-                        ? SIG_WAVE_SQUARE
-                        : SIG_WAVE_SINE;
+        g_trk_sq_ratio = r;
+
+        /* ★ 加迟滞，别让判据在阈值附近横跳 ★
+         *   实测踩过：比例在 414‰/428‰ 附近抖，判据一过一不过，
+         *   波形就在"方波/正弦"之间反复切，输出跟着一次次重铺表。
+         *   所以：判成方波要 ≥350‰，但要掉到 <250‰ 才退回正弦。 */
+        {
+            const uint32_t hi = (uint32_t)(TRK_SQUARE_RATIO * 1000.0f);   /* 350 */
+            const uint32_t lo = hi - 100U;                                /* 250 */
+
+            if (s_detected_wave == SIG_WAVE_SQUARE)
+            {
+                if (r < lo) { s_detected_wave = SIG_WAVE_SINE; }
+            }
+            else
+            {
+                if (r >= hi) { s_detected_wave = SIG_WAVE_SQUARE; }
+            }
+        }
         g_trk_wave = (uint32_t)s_detected_wave;
 
         s_lo_rail = 0U;
@@ -740,12 +852,34 @@ static void trk_wave_detect(void)
   */
 static void trk_apply_waveform(void)
 {
-    uint32_t vmin = (s_env_min > 0) ? (uint32_t)s_env_min : 0U;
-    uint32_t vmax = (s_env_max > 0) ? (uint32_t)s_env_max : 0U;
+    uint32_t vmin;
+    uint32_t vmax;
     uint8_t  need_lv = 0U;
 
-    g_trk_vmin = vmin;
-    g_trk_vmax = vmax;
+    /* ★ 电平取"每周期真实极值"（s_lvl_min/max），不取会衰减的包络 ★
+     *   取包络的话它每个周期内都漂移几十个码值，会被判成"电平变了"，
+     *   于是每秒重铺上百次表，把主循环拖垮 → 丢样本 → 频率算错。
+     *   详见 s_per_min 的说明。 */
+    if (s_lvl_valid == 0U)
+    {
+        return;                         /* 还没量够一个周期，先不动输出 */
+    }
+
+    /* ★ 节流：波形/电平/占空比都是慢变量，而每写一次都可能重铺整张表
+     *   （0.5~1ms，期间 TIM6 停着、输出冻结）。不节流的话这几个量的小抖动
+     *   会每秒触发几十次重铺，主循环被拖过 4.1ms → DMA 套圈丢样本 → 频率算错。
+     *   首次（s_app_valid==0）不节流，保证上电后能立刻匹配上。 */
+    if (s_app_valid != 0U)
+    {
+        if ((uint32_t)(HAL_GetTick() - s_param_ms) < TRK_PARAM_MIN_MS)
+        {
+            return;
+        }
+    }
+    s_param_ms = HAL_GetTick();
+
+    vmin = s_lvl_min;
+    vmax = s_lvl_max;
 
     /* ---- 电压：对方低/高电平码值直接搬过去 ---- */
     if (s_app_valid == 0U)
@@ -854,6 +988,30 @@ void Track_Init(void)
     s_app_wave      = 0xFFU;
     s_app_duty      = -1.0f;
 
+    /* 每周期极值 / 稳定电平 / DMA 绕圈检测 */
+    s_per_min    = 4095;
+    s_per_max    = 0;
+    s_lvl_valid  = 0U;
+    s_lvl_min    = 0U;
+    s_lvl_max    = 0U;
+    /* DMA 落后检测的零点：当前 CPU 周期数 + 当前 DMA 写入位置。
+     * ★ 一上电就对齐，别让 backlog 凭空多出来。 */
+    s_last_fill  = fill;
+    s_fill_valid = 1U;
+    g_trk_laps   = 0U;
+
+    /* ★ 打开 DWT 周期计数器 —— 采样时间基准靠它 ★
+     *   TIM7 每 340 个 170MHz 周期触发一次 ADC，CPU 同源，
+     *   所以"应该采了多少样本 = 周期数/340"是精确的。 */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0U;
+    DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+    s_cyc_base  = DWT->CYCCNT;
+
+    /* s_rd 是"下一个要处理的缓冲下标"，s_total 是对应的全局样本号。
+     * 两者必须同步推进：s_rd == (初始fill + s_total) % ADC_BUF_LEN。 */
+    s_total = 0U;
+
     /* ★ 让 signal.c 进入锁相模式：表头恒为相位 0，Signal_Realign() 才有意义 ★ */
     Signal_SetPhaseLock(1U);
 
@@ -867,7 +1025,9 @@ void Track_Poll(void)
 {
     const uint16_t *buf;
     uint32_t        fill;
-    uint32_t        avail;
+    uint32_t        avail = 0U;
+    uint32_t        backlog = 0U;
+    uint32_t        s_target = 0U;
     uint32_t        i;
     static uint8_t  s_hold_prev = 0U;
     uint8_t         hold = (g_trk_hold_hz >= 1.0f) ? 1U : 0U;
@@ -913,15 +1073,34 @@ void Track_Poll(void)
         fill = 0U;
     }
 
-    /* 从 s_rd 到 fill 之间新增的样本数（环形减法）。
-     * ⚠️ 前提是两次调用之间 DMA 没有整整绕一圈以上 ——
-     *    主循环最慢也就几百微秒，绕一圈要 4.1ms，安全。 */
-    avail = (fill + ADC_BUF_LEN - s_rd) % ADC_BUF_LEN;
-
-    /* 尾部留一点不碰，等 DMA 写完那几个样本 */
-    if (avail > (ADC_BUF_LEN - TRK_SAFE_MARGIN))
+    /* ---- ★ 落后检测：时间基准取 CPU 周期数，不数 DMA 绕圈 ★ ----
+     *   target  = 从 Init 到现在"应该已经采了多少样本"（DWT 周期数 / 340，精确）
+     *   backlog = target - s_total = 还没处理的积压量
+     *   只要主循环跟得上，backlog 会一直很小；一旦超过一整圈，
+     *   说明 DMA 把没处理的样本覆盖掉了，这时 s_total 与实际时间脱节，
+     *   f=(沿数-1)*fs/span 会算错，必须清空过零历史重来。
+     *
+     *   ★ 为什么不能用"fill 变小就 +1 圈"来数写入量 ★
+     *     两次 poll 之间若 DMA 走了整整一圈还多一点（2048+k），
+     *     fill 结束时反而比上次大，那一圈就看不见了 → 少算 2048 → 频率偏高。 */
     {
-        avail = ADC_BUF_LEN - TRK_SAFE_MARGIN;
+        s_target = (DWT->CYCCNT - s_cyc_base) / TRK_CYC_PER_SAMPLE;
+        backlog  = s_target - s_total;
+
+        if (backlog >= ADC_BUF_LEN)
+        {
+            g_trk_laps++;
+            trk_clear_meas();
+            s_total     = s_target;     /* 时间轴对齐到当前，别让误差累积 */
+            s_rd        = fill;
+            s_prev      = (int32_t)buf[(fill + ADC_BUF_LEN - 1U) % ADC_BUF_LEN];
+            s_prev_g    = s_total;
+            s_per_min   = 4095;
+            s_per_max   = 0;
+            g_trk_samples += ADC_BUF_LEN;
+            return;
+        }
+        avail = backlog;
     }
 
     for (i = 0U; i < avail; i++)
