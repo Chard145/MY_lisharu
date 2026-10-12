@@ -33,6 +33,20 @@
 > **改中文源码文件时不要用 PowerShell 文本管道**
 > （`(Get-Content -Raw) -replace ... | Set-Content -Encoding UTF8`）。
 > 会把 UTF-8 中文按 GBK 误读，注释整片变成 `?`。要用 `edit` / `write` 工具。
+>
+> **带中文的 `.ps1` 必须存成 UTF-8 *带 BOM*。**
+> Windows PowerShell 5.1 对无 BOM 的 `.ps1` 按 ANSI(GBK) 读，
+> 中文注释会被解成乱码，连字符串引号都会被吃掉，
+> 报错是 `The string is missing the terminator` / `Missing closing '}'`，
+> 看起来像语法错误，其实是编码。`write` 工具写出来的是无 BOM 的，
+> 补一句字节级操作即可（不要用文本管道，会二次转码）：
+> ```powershell
+> $b = [IO.File]::ReadAllBytes($p); $bom = [byte[]](0xEF,0xBB,0xBF)
+> $n = New-Object byte[] ($bom.Length + $b.Length)
+> [Array]::Copy($bom,0,$n,0,3); [Array]::Copy($b,0,$n,3,$b.Length)
+> [IO.File]::WriteAllBytes($p, $n)
+> ```
+> 纯 ASCII 的 `.bat` / `.ps1` 不受影响（所以 `install.bat` 那类才写成全英文）。
 
 ---
 
@@ -152,7 +166,78 @@ JLink.exe -CommanderScript flash.jlink
 
 ---
 
-## 6. 相关技能
+## 6. 频率跟踪 / 波形复现（`Core/Src/track.c`）
+
+目标：输出与对方"**同频 + 同波形 + 同电压 + 同相位**"（做李萨如图形演示用）。
+
+### 数据流
+
+```
+对方信号 ──┬─> PB15 (ADC2_IN15)  ─> adc_buf[2048] ─> 过零插值测频 ─> Signal_SetFreq()
+           │    （模拟通路）                             │
+           └─> PB15 (EXTI15)     ─> 上升沿中断 ─────────┴─> Signal_Realign()  ★相位对齐★
+                （数字通路）
+本机输出 <── PA2 (DAC3 → OPAMP1)
+```
+
+### 四件事分别怎么实现的
+
+| 要素 | 做法 |
+|---|---|
+| **同频** | 上升沿过零 + 线性插值 + 滑窗跨多周期。开环标定实测误差 **0.000~0.004%**（1k~50kHz） |
+| **同波形** | 判据 = `min(贴下轨比例, 贴上轨比例)`：方波≈500‰、正弦≈205‰、三角≈100‰、恒定电平≈0 |
+| **同电压** | 把包络量出的对方低/高电平码值**原样**交给 `Signal_SetLevels()`，不归一化 |
+| **同相位** | **PB15 一芯两用**：ADC 走 pad 的模拟通路、EXTI 走数字通路，互不干扰 → 不用多加线 |
+
+### ★ PB15 一芯两用（本项目最取巧的一处）
+
+参考工程 `test4_prj` 用 COMP2(PA3)+TIM2/TIM3 输入捕获(PA15/PB4) 测频，
+但它的 `sarg`（相位角）是**手填的固定值**，并没有闭环相位对齐。
+本工程用更省的做法：把 PB15 从 `GPIO_MODE_ANALOG` 改成 `GPIO_MODE_IT_RISING`，
+**ADC2_IN15 照样能采**（两条通路在芯片里是分开的），白得一个精确的上升沿事件。
+
+已实测验证：把 MODER 用 J-Link 写回"模拟"后 `adc_buf` 依然全 0
+（说明当时引脚本来就是 0V），即 EXTI 配置**不会**破坏模拟通路。
+
+### 关键常量（`track.c`）
+
+- `TRK_ENV_PERIOD 32` —— 峰值包络衰减周期。**必须用包络检波，不能用"每 512 点统计 min/max"**：
+  方波半周期可能远长于 512 点，整段落在一个电平里会让峰峰值算成 0 → 误判"无信号"（踩过）
+- `TRK_MIN_CROSS 3` / `TRK_MAX_CROSS 12` / `TRK_SPAN_SAMPLES 1500`
+- `TRK_EDGE_GUARD_CYC 3400` —— EXTI 去抖 20µs（DWT 周期计数）
+- `TRK_LEVEL_EPS 16` / `TRK_DUTY_EPS 0.01` —— 电平/占空比变化阈值，
+  因为每次写都可能触发重铺表（0.5ms 冻结输出），不能跟着包络抖动乱写
+
+### 踩过的四个坑（都在这里）
+
+1. **自监控闭环失控**：`signal_apply()` 换频时写 `DHR12R1 = sine_tab[0]`（中点），
+   这个台阶被自己的 ADC 采到成了假上升沿 → 一路从 1kHz 爬到 17kHz。
+   修法：换频保持相位连续（读 DMA 的 CNDTR 反推相位再重铺表）。**接真实外部信号时不会发生。**
+2. **换频冻结输出**：`sine_fill_n()` 每次换频跑 N 次 `sinf()`（N=1022 约 0.5ms），
+   期间 TIM6 停着、输出被冻住；跟踪器每秒调几十次 → 测量窗口经常整窗落在冻结点上。
+   修法：**点数没变时走快路径，只动 TIM6 的 PSC/ARR，完全不碰 DMA 和表**。
+   另外短暂丢信号**不要**清 `s_set_hz`，否则"丢信号→强制换频→输出被冻→更像丢信号"滚成正反馈。
+3. **方波锁不上**：见上面 `TRK_ENV_PERIOD` 那条。
+4. **恒定电平误判成方波**：只统计"贴任意一轨"的总比例时，恒高电平算出来是 1000‰。
+   **必须取上下轨比例的 min。** 后果很隐蔽：对方信号一断，输出会从正弦悄悄变方波。
+
+### 调试工具
+
+- `Port\adc_live.bat` —— 实时显示 PB15 上的 min/max/pk 电压。
+  **排查"跟踪器读不到信号"的第一件事就是跑它**：pk≈4000 有信号，pk≈0 是条直线。
+- `g_trk_hold_hz` 写非 0 值 → 开环标定模式：锁定输出频率，只报告测量值，用来单独验证测频精度。
+- 全局量：`g_trk_in_hz / out_hz / pk / valid / cross_n / edges / wave / vmin / vmax / duty_ppm`
+  （地址从 `arm-none-eabi-nm build/Debug/project.elf` 查）
+
+### 已知物理限制
+
+- **方波边沿** = 一个 DAC 更新周期（N=1024、150Hz 时约 6.5µs）。DAC 物理上做不到更陡。
+  真要 ns 级边沿只能改用定时器 PWM 输出，但那样就出不了正弦了（需求要同时支持，所以不用）。
+- **相位精度** ≈ 0.03~0.1°（EXTI 中断响应抖动）。要更高得加线走 TIM 硬件从模式 + 改 CubeMX 的
+  DAC 触发源，代价大收益小。
+- 方波测频时线性插值把沿定位在两个样本中点，但这是**恒定偏差**，首尾相减时自动抵消。
+
+## 7. 相关技能
 
 - `jlink-rtt-bridge` —— RTT / J-Scope / VOFA+ 传数据的完整用法与本机现场记忆。
 - `scope-sds1052a` —— 示波器读数（LeCroy 老式命令集，不是标准 SCPI）。
