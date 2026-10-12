@@ -134,6 +134,28 @@ extern volatile uint32_t g_trk_awd_irq;
  *   （那样相位就完全没在对齐，但不会有任何报错，只是输出看着一直在跳相）。 */
 extern volatile uint32_t g_trk_awd_heal;
 
+/* ★★★ 相位奇偶性守卫（李萨如"跳到中心对称位置并停住"的根治手段）★★★
+ *
+ *   背景：AWD 只有"谁在窗口外"这一个布尔量，**过零方向完全靠状态机交替翻转推断**。
+ *         所以只要"多来一个假事件"或"少来一个真事件"，奇偶性就永久反掉 ——
+ *         从此每个"上升沿"都复位在真正的下降沿上 → 输出永久差 180°
+ *         → XY 模式下的李萨如图形跳到中心对称位置并停在那里。
+ *
+ *   修法：真过零之间必定相隔半个周期，用这个时间关系当场判真假。
+ *   g_trk_awd_glitch : 间隔不足半周期 → 判为假事件，**整条丢弃**（状态都不翻），
+ *                      这样假事件再也带不偏奇偶性。稳态下应该很少、且不随输入变化。
+ *   g_trk_awd_miss   : 间隔约等于 k(≥2) 个半周期 → 中间漏了沿。稳态下应该是 0。
+ *   g_trk_awd_flip   : 真正执行了奇偶性纠正的次数。**稳态下应该是 0**；
+ *                      在涨说明守卫正在不停地把状态拉回来（说明仍有干扰源）。 */
+extern volatile uint32_t g_trk_awd_glitch;
+extern volatile uint32_t g_trk_awd_miss;
+extern volatile uint32_t g_trk_awd_flip;
+
+/* ★ 因"刚改过 AWD 窗口"而被丢弃相位复位的次数。
+ *   主循环改窗口（阈值随电平缓慢漂移）时，新窗口可能立刻把当前样本判成"出界"，
+ *   凭空造出一个假过零。这次事件只用来同步状态，绝不拿来复位相位。 */
+extern volatile uint32_t g_trk_awd_skip;
+
 /* ============================== 诊断计数（J-Link 可直接读）============================== */
 extern volatile uint32_t g_trk_measures;   /* 算出频率结果的次数 */
 extern volatile uint32_t g_trk_updates;    /* 真正调用 Signal_SetFreq() 的次数 */
