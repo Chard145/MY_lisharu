@@ -99,19 +99,25 @@
 /* ==================== 波形识别 / 电平搬运 / 相位对齐 参数 ==================== */
 
 /* "贴轨"判据的带宽：峰峰值 / 这个数。5 → 上下各 20%。
- * 各波形落在轨道带里的样本比例（理论值）：
- *     方波   ~100%（除边沿）      三角  20%      正弦  41%
- * 所以阈值取 0.70 能把方波干净地分出来。 */
+ * ★ 判据是 min(贴下轨比例, 贴上轨比例) —— 取 min 而不是取总数，原因见 trk_wave_detect()。
+ *   各波形按 min 算出来的理论值：
+ *       方波  上下轨各 ~500‰ → min ~500   ← 判为方波
+ *       正弦  |x|>0.8 各 ~205‰ → min ~205
+ *       三角  各 ~100‰        → min ~100
+ *       恒定电平  只有一轨有样本 → min ~0
+ *   所以阈值取 0.35(350‰)：500 过线、205 不过线，干净分开。
+ *   ⚠️ 踩过一次：判据从"总贴轨比例"改成 min 之后忘了同步改这个宏，
+ *      结果方波算出来 461‰ 卡在 700‰ 阈值下面，被误判成正弦。 */
 #define TRK_RAIL_BAND_DIV   5
-#define TRK_SQUARE_RATIO    0.70f
+#define TRK_SQUARE_RATIO    0.35f
 
 /* 每这么多样本判一次波形类型（500kSPS 下 4096 点 ≈ 8.2ms，够快也不至于抖） */
 #define TRK_DETECT_LEN      4096U
 
-/* EXTI 去抖：两次上升沿至少间隔这么多 CPU 周期（170MHz 下 3400 ≈ 20us）。
- * 方波的半周期远大于 20us，所以正常信号不会被误滤掉，
- * 但对方边沿上的振铃/毛刺不会连触发好几次。 */
-#define TRK_EDGE_GUARD_CYC  3400U
+/* AWD 阈值（= 对方波形的直流中点）的允许范围。
+ * 太靠近两端就没法可靠判边沿了，所以要夹住。 */
+#define TRK_AWD_THR_MIN     64U
+#define TRK_AWD_THR_MAX     4031U
 
 /* 电平/波形参数只在变化超过这些阈值时才真正写进 signal.c ——
  * 因为每次写都可能触发重铺表（0.5ms 冻结输出），不能让它跟着包络抖动乱写。 */
@@ -153,7 +159,7 @@ volatile uint32_t g_trk_resets   = 0U;
 volatile uint32_t g_trk_samples  = 0U;
 
 /* ---- 波形匹配 / 相位对齐 诊断 ---- */
-volatile uint32_t g_trk_edges    = 0U;   /* EXTI 上升沿中断实际执行 Realign 的次数 */
+volatile uint32_t g_trk_edges    = 0U;   /* ADC 模拟看门狗(AWD)实际执行 Realign 的次数 */
 volatile uint32_t g_trk_edge_skip= 0U;   /* 被去抖滤掉的沿（振铃/毛刺） */
 volatile uint32_t g_trk_wave     = 0U;   /* 识别出的波形：0=正弦 1=三角 2=方波 */
 volatile uint32_t g_trk_sq_ratio = 0U;   /* 贴轨样本比例 ×1000（方波≈1000，正弦≈410） */
@@ -199,9 +205,9 @@ static uint8_t  s_duty_done;        /* 占空比是否已经测到过一次 */
 static float    s_duty = 0.5f;      /* 平滑后的占空比 */
 static uint8_t  s_detected_wave = SIG_WAVE_SINE;
 
-static uint32_t s_last_edge_cyc;    /* 上次 EXTI 的时刻（DWT 周期计数，用于去抖） */
-static uint8_t  s_edge_inited;
-static uint8_t  s_phaselock_on;     /* 1 = 允许 EXTI 去复位输出相位（有有效信号时才开） */
+static uint8_t  s_awd_arm_up;       /* AWD 窗口状态：1 = 等上升沿  0 = 等下降沿 */
+static uint32_t s_awd_thr = 2048U;  /* AWD 阈值 = 对方波形的直流中点（码值） */
+static uint8_t  s_phaselock_on;     /* 1 = 允许 AWD 中断去复位输出相位（有有效信号时才开） */
 
 static uint8_t  s_app_valid;        /* 下面几个"已经写进 signal.c 的值"是否有效 */
 static uint32_t s_app_vmin;
@@ -209,11 +215,12 @@ static uint32_t s_app_vmax;
 static uint8_t  s_app_wave = 0xFFU;
 static float    s_app_duty = -1.0f;
 
-/* 前置声明：这三个函数定义在 trk_feed / trk_maybe_measure 之后，
+/* 前置声明：这几个函数定义在 trk_env_update / trk_feed / trk_maybe_measure 之后，
  * 但它们要被前面的函数调用，所以必须先声明，否则编译器按隐式声明处理会报错。 */
 static void trk_duty_update(void);
 static void trk_wave_detect(void);
 static void trk_apply_waveform(void);
+static void trk_awd_set_thr(uint32_t thr);
 
 /* ============================== 内部函数 ============================== */
 
@@ -292,8 +299,8 @@ static void trk_env_update(void)
             g_trk_resets++;
         }
         g_trk_valid = 0U;
-        s_phaselock_on = 0U;            /* ★ 没信号时禁止 EXTI 复位相位 ★
-                                         *   否则悬空脚的噪声会不停地把输出波形打断成碎片。 */
+        s_phaselock_on = 0U;            /* ★ 没信号时禁止 AWD 中断复位相位 ★
+                                         *   否则阈值附近的噪声会不停地把输出波形打断成碎片。 */
         trk_clear_meas();
         return;
     }
@@ -318,8 +325,11 @@ static void trk_env_update(void)
         }
     }
 
+    /* AWD 的阈值就跟这个直流中点走，对方信号偏置变了也能自己跟上 */
+    trk_awd_set_thr((uint32_t)s_dc);
+
     g_trk_valid    = 1U;
-    s_phaselock_on = 1U;                /* 确认有有效信号了，才允许 EXTI 复位输出相位 */
+    s_phaselock_on = 1U;                /* 确认有有效信号了，才允许 AWD 中断复位输出相位 */
 }
 
 /**
@@ -529,81 +539,136 @@ static void trk_feed(uint32_t g, uint16_t raw)
  *   同波形 —— 统计"贴在上下轨附近的样本比例"区分方波 / 正弦
  *   同电压 —— 把包络量出来的对方低/高电平码值**原样**交给 Signal_SetLevels()，
  *             不做任何归一化、不做缩放，所以 DAC 输出的电压范围与对方逐码一致
- *   同相位 —— ★核心★ PB15 一芯两用：既做 ADC2_IN15 又做 EXTI15 上升沿中断
+ *   同相位 —— ★核心★ 用 ADC 自己的**模拟看门狗 AWD1** 做硬件边沿检测
  *
- * 为什么一根线都不用多加（关键事实，已查过手册与引脚表）：
- *   STM32 的 ADC 输入是 pad 直连的**模拟通路**，EXTI 走的是 pad → 施密特触发器
- *   的**数字通路**，两条路在芯片内部是分开的。GPIO 的 MODER 只影响数字那一条，
- *   所以把 PB15 从 GPIO_MODE_ANALOG 改成 GPIO_MODE_IT_RISING 之后，
- *   ADC2_IN15 照样能采到对方波形，同时还白得一个"上升沿到达"的中断事件。
+ * ============================ ★★★ 一段走错的路（务必先读）★★★ ============================
  *
- * 相位精度：EXTI 中断响应 + Signal_Realign() 共约 1~2us，抖动约 0.5us。
- *   150Hz 时相位误差 ≈ 0.5us/6.67ms × 360° ≈ 0.03°，再算上 2us 的固定延迟
- *   （可用 Signal_SetPhaseDeg() 补掉）也远小于 1°。
- *   对李萨如图形演示来说绰绰有余。想更高只能把对方信号再引一根线到
- *   TIM 捕获脚走硬件从模式，并且要把 DAC 触发源从 TIM6 换成 TIM2_TRGO，
- *   需要改 CubeMX —— 代价大、收益小，本工程不做。
+ *   最初的做法是"PB15 一芯两用"：把 PB15 从 GPIO_MODE_ANALOG 改成
+ *   GPIO_MODE_IT_RISING，指望 ADC2_IN15 走模拟通路、EXTI15 走数字通路互不干扰，
+ *   这样一根线都不用多加。**实测行不通，而且现象极具迷惑性：**
+ *
+ *       同一根信号线、同一个固件、只改 GPIOB->MODER 的 PB15 两位：
+ *           PB15 = 00（数字输入，EXTI 需要）→ adc_buf 全 0，ADC 完全读不到
+ *           PB15 = 11（模拟）              → adc_buf 全 4095，正常采到波形
+ *       用 J-Link 现场改 MODER、连续三次读数验证，结果稳定复现。
+ *
+ *   更坑的是：数字侧看起来一切正常（IDR 读到高电平、EXTI 也真的中断过），
+ *   只有 ADC 读不到 —— 所以一开始误判成"对方信号断了"，白白查了很久。
+ *   **结论：这颗芯片上 ADC 输入必须保持 GPIO 模拟模式，不能借用 EXTI。**
+ *
+ * ============================== 改用 AWD1（正解）==============================
+ *
+ *   AWD（Analog Watchdog）是 ADC 内部的硬件比较器：每次转换完就把结果和
+ *   [LT1, HT1] 比一下，超出窗口就置标志并发中断。它工作在模拟模式，
+ *   完全不用碰 GPIO，所以和 ADC 采样天然兼容。
+ *
+ *   单靠 AWD 得到的是"电平"而不是"边沿"（信号在窗口外时**每个样本**都会触发），
+ *   所以这里用**窗口翻转**把它变成一个施密特触发器：
+ *
+ *       状态 A（等上升沿）：窗口 = [0,   thr-1] → 样本 ≥ thr 时触发 = 上升穿越
+ *       状态 B（等下降沿）：窗口 = [thr, 4095 ] → 样本 < thr 时触发 = 下降穿越
+ *
+ *   中断里只看当前是哪个状态：是"上升"就调 Signal_Realign() 把输出相位拉回
+ *   上升沿，然后把窗口翻到 B；是"下降"就只把窗口翻回 A。
+ *   两个状态互相纠正，即使被干扰打乱也会在 1 个样本内自己回到正确状态。
+ *
+ *   延迟 = 1 个 ADC 转换周期（500kSPS 下 2us）+ AWD 的 2 次连续滤波（4us）。
+ *   166Hz 时相位误差 ≈ 6us/6ms × 360° ≈ 0.36°，对李萨如图形绰绰有余。
+ *   ★ 滤波那 2 个样本是必须的：不加的话阈值附近的噪声会让 AWD 每个样本都中断，
+ *     500kSPS 就是 50 万次中断/秒，直接压垮 CPU。
+ *
+ *   阈值 thr 取跟踪器量出来的直流中点 s_dc，会跟着对方信号自动调整。
  */
 
 /**
-  * @brief  把 PB15 同时配成 ADC 输入 + EXTI15 上升沿中断
-  * @note   ⚠️ 必须在 MX_ADC2_Init() **之后**调用 ——
-  *         HAL_ADC_MspInit() 会把 PB15 设成 GPIO_MODE_ANALOG，本函数要覆盖它。
+  * @brief  设置 AWD1 的监视窗口 [lo, hi]
+  * @note   整个 TR1 一起重写，所以顺带把 AWDFILT 保持成"连续 2 次"（见宏定义）。
   */
-static void trk_exti_init(void)
+static void trk_awd_window(uint32_t lo, uint32_t hi)
 {
-    GPIO_InitTypeDef gi = {0};
+    if (lo > 4095U) { lo = 4095U; }
+    if (hi > 4095U) { hi = 4095U; }
 
-    gi.Pin   = GPIO_PIN_15;
-    gi.Mode  = GPIO_MODE_IT_RISING;     /* 数字输入 + 上升沿中断（ADC 模拟通路不受影响） */
-    gi.Pull  = GPIO_NOPULL;
-    gi.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOB, &gi);
-
-    /* DWT 周期计数器：给 EXTI 去抖用（精度 5.9ns，比 HAL_GetTick 的 1ms 精确得多） */
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CYCCNT = 0U;
-    DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
-
-    s_edge_inited   = 0U;
-    s_last_edge_cyc = 0U;
-
-    /* 优先级给最高（0）：相位对齐的抖动直接取决于这个中断能多快进来，
-     * 被别的高优先级中断挡住多久，相位就偏多久。 */
-    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0U, 0U);
-    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+    ADC2->TR1 = ((hi & 0xFFFU) << ADC_TR1_HT1_Pos)
+              | (lo & 0xFFFU)
+              | ADC_AWD_FILTERING_2SAMPLES;
 }
 
 /**
-  * @brief  对方信号上升沿中断 —— 相位对齐的执行点
-  * @note   中断里只做寄存器操作（不重铺表），耗时 1~2us。
-  *         输入 150Hz 时每秒 150 次，CPU 占用可忽略。
+  * @brief  配置 ADC2 的模拟看门狗做"上升沿检测"
+  * @note   ⚠️ 必须在 MX_ADC2_Init() / Adc_Vofa_Init() **之后**调用。
+  *         ★ 本函数**不改 PB15 的 GPIO 模式** ★
+  *         必须保持 GPIO_MODE_ANALOG（CubeMX 在 HAL_ADC_MspInit 里设的），
+  *         改成数字输入会让 ADC 完全读不到这个引脚 —— 详见文件上半部分的说明。
   */
-void EXTI15_10_IRQHandler(void)
+static void trk_awd_init(void)
 {
-    if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_15) != 0U)
+    /* 监视通道 = 15（PB15）；只在规则组使能，注入组不用 */
+    ADC2->CFGR &= ~(ADC_CFGR_AWD1CH | ADC_CFGR_JAWD1EN);
+    ADC2->CFGR |= ADC_CFGR_AWD1EN | (15U << ADC_CFGR_AWD1CH_Pos);
+
+    s_awd_arm_up = 1U;                          /* 上电先等上升沿 */
+    trk_awd_window(0U, (s_awd_thr > 0U) ? (s_awd_thr - 1U) : 0U);
+
+    ADC2->ISR = ADC_ISR_AWD1;                   /* 清一次残留标志 */
+    ADC2->IER |= ADC_IER_AWD1IE;
+
+    /* 优先级给最高（0）：相位对齐的精度直接取决于这个中断能多快进来 */
+    HAL_NVIC_SetPriority(ADC1_2_IRQn, 0U, 0U);
+    HAL_NVIC_EnableIRQ(ADC1_2_IRQn);
+}
+
+/**
+  * @brief  阈值跟着对方的直流中点走
+  * @note   由 trk_env_update() 在 s_dc 变化时调用，顺便把当前窗口按新阈值重设。
+  */
+static void trk_awd_set_thr(uint32_t thr)
+{
+    if (thr < TRK_AWD_THR_MIN) { thr = TRK_AWD_THR_MIN; }
+    if (thr > TRK_AWD_THR_MAX) { thr = TRK_AWD_THR_MAX; }
+
+    if (thr != s_awd_thr)
     {
-        __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_15);
-
-        if (s_phaselock_on != 0U)
+        s_awd_thr = thr;
+        if (s_awd_arm_up != 0U)
         {
-            uint32_t now = DWT->CYCCNT;
+            trk_awd_window(0U, thr - 1U);       /* 等上升沿 */
+        }
+        else
+        {
+            trk_awd_window(thr, 4095U);         /* 等下降沿 */
+        }
+    }
+}
 
-            /* 去抖：两次沿靠得太近就判为振铃/毛刺。
-             * 方波半周期远大于 20us，正常信号不会误滤。 */
-            if ((s_edge_inited != 0U) &&
-                ((uint32_t)(now - s_last_edge_cyc) < TRK_EDGE_GUARD_CYC))
-            {
-                g_trk_edge_skip++;
-            }
-            else
-            {
-                s_last_edge_cyc = now;
-                s_edge_inited   = 1U;
+/**
+  * @brief  ★ 相位对齐的执行点 ★ ADC 模拟看门狗中断
+  * @note   中断里只做寄存器操作（不重铺表），耗时约 1~2us。
+  *         输入 166Hz 时每秒 166 次，CPU 占用可忽略。
+  */
+void ADC1_2_IRQHandler(void)
+{
+    if ((ADC2->ISR & ADC_ISR_AWD1) != 0U)
+    {
+        ADC2->ISR = ADC_ISR_AWD1;               /* 写 1 清标志 */
 
-                Signal_Realign();       /* ★ 把输出相位硬拉回上升沿 ★ */
+        if (s_awd_arm_up != 0U)
+        {
+            /* 刚才是"样本 ≥ thr" → 这就是上升沿 */
+            s_awd_arm_up = 0U;
+            trk_awd_window(s_awd_thr, 4095U);   /* 转去等下降沿 */
+
+            if (s_phaselock_on != 0U)
+            {
+                Signal_Realign();               /* ★ 把输出相位硬拉回上升沿 ★ */
                 g_trk_edges++;
             }
+        }
+        else
+        {
+            /* 刚才是"样本 < thr" → 下降沿，只翻窗口，别的什么都不做 */
+            s_awd_arm_up = 1U;
+            trk_awd_window(0U, s_awd_thr - 1U);
         }
     }
 }
@@ -792,8 +857,10 @@ void Track_Init(void)
     /* ★ 让 signal.c 进入锁相模式：表头恒为相位 0，Signal_Realign() 才有意义 ★ */
     Signal_SetPhaseLock(1U);
 
-    /* ★ PB15 一芯两用：既做 ADC2_IN15 又做 EXTI15 上升沿中断（必须在 ADC 初始化之后）★ */
-    trk_exti_init();
+    /* ★ 相位对齐：用 ADC 自己的模拟看门狗做硬件边沿检测 ★
+     *   ⚠️ 这里**不碰 PB15 的 GPIO 模式** —— 必须保持模拟模式，
+     *      改成数字输入会让 ADC 完全读不到这个引脚（实测，见文件上半部分的说明）。 */
+    trk_awd_init();
 }
 
 void Track_Poll(void)
