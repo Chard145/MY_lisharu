@@ -90,6 +90,80 @@ void            Signal_Measure(void);
   */
 void            Signal_SlowTest(void);
 
+/* ============================== 输出波形类型（2026-10-12 加）==============================
+ * 多波形输出的思路参考了 test4_prj 工程的 mak_sin_tab.c：
+ * 那里把波形生成参数化成 (mode, dots, vb, vp, sarg)，本工程沿用同样的参数含义，
+ * 但表的相位处理接的是本工程自己的"相位连续"机制。
+ *
+ *   mode      含义
+ *   --------  ----------------------------------------------------------
+ *   SINE      正弦（默认）
+ *   TRIANGLE  三角波
+ *   SQUARE    方波（占空比可调，边沿 = 一个 DAC 更新周期，这是 DAC 能做到的最陡）
+ *   SAWTOOTH  上升锯齿
+ *
+ * ★ 约定：表的第 0 点 = 波形相位 0 = **上升沿所在位置**。
+ *   方波的表第 0 点是高电平；正弦的表第 0 点是"从负穿正的过零点"。
+ *   这样 Signal_Realign() 把 DMA 挪回表头时，输出就正好从上升沿重新开始，
+ *   配合 EXTI 检测到的对方上升沿，就能做到同频同相。 */
+#define SIG_WAVE_SINE       0U
+#define SIG_WAVE_TRIANGLE   1U
+#define SIG_WAVE_SQUARE     2U
+#define SIG_WAVE_SAWTOOTH   6U
+
+/**
+  * @brief  设置输出波形类型
+  * @param  mode SIG_WAVE_xxx
+  * @note   只置"待重铺"标志，真正的重铺在下次 Signal_SetFreq()/Signal_Realign() 时做
+  */
+void            Signal_SetWave(uint8_t mode);
+
+/**
+  * @brief  设置波形的高低电平（直接给 12 位码值）
+  * @param  vmin 低电平码值（0~4095）
+  * @param  vmax 高电平码值（0~4095）
+  * @note   ★ 这是"电压一毛一样"的关键 ★
+  *         对方方波的低/高电平被 ADC 量出来是多少码值，输出就用多少码值，
+  *         不做任何归一化，所以 DAC 输出的电压范围与对方完全一致。
+  */
+void            Signal_SetLevels(uint32_t vmin, uint32_t vmax);
+
+/**
+  * @brief  设置方波的占空比
+  * @param  duty 0.0~1.0，表示一个周期里高电平所占比例
+  */
+void            Signal_SetDuty(float duty);
+
+/**
+  * @brief  相位微调（度）
+  * @param  deg 正数表示输出相位"提前" deg 度
+  * @note   用来补偿"检测到对方上升沿 → 真的改变输出"之间的固定延迟。
+  *         默认 0，一般不需要动。
+  */
+void            Signal_SetPhaseDeg(float deg);
+
+/**
+  * @brief  ★ 进入/退出"锁相模式"
+  * @param  on 1 = 表头恒等于相位 0（配合 Signal_Realign() 用）；0 = 原来的相位连续行为
+  * @note   必须打开才能真正做到"同相" —— 关着的时候表里会烘焙着任意相位，
+  *         Realign 把 DMA 挪回表头后相位是乱的。
+  */
+void            Signal_SetPhaseLock(uint8_t on);
+
+/**
+  * @brief  ★★ 相位硬复位：把输出波形立刻拉回相位 0（上升沿）★★
+  * @note   由 EXTI 检测到对方上升沿后调用。做的事：
+  *           TIM6 停表 → DMA 关 → CNDTR 回表长、CMAR 回表头 → DMA 开
+  *           → TIM6 CNT 清零 → TIM6 开表
+  *         耗时约 1~2us（全是寄存器操作，不重铺表），
+  *         所以每个输入周期都调用一次也不会拖累 CPU。
+  *         ★ 表头必须是"相位 0"，见 SIG_WAVE_xxx 的约定。
+  */
+void            Signal_Realign(void);
+
+/** @brief 取当前波形类型 */
+uint8_t         Signal_GetWave(void);
+
 /**
   * @brief  4Hz~700Hz 扫频（非阻塞版）
   * @note   Signal_Sweep_Init() 在 USER CODE BEGIN 2 里调一次，

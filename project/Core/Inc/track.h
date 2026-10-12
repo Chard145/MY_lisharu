@@ -93,6 +93,23 @@ uint32_t Track_IsValid(void);
  */
 extern volatile float g_trk_hold_hz;
 
+/* ============================== 波形匹配 / 相位对齐 诊断 ==============================
+ * 2026-10-12 加：目标是输出与对方"同频 + 同波形 + 同电压 + 同相位"。
+ *   g_trk_wave      : 识别出的波形（0=正弦 1=三角 2=方波），自动判据见 track.c
+ *   g_trk_sq_ratio  : "贴轨样本比例"×1000 —— 方波≈1000，正弦≈410，三角≈200
+ *   g_trk_vmin/vmax : 对方波形的低/高电平码值，**原样**搬给 DAC 当输出上下电平
+ *   g_trk_duty_ppm  : 对方方波的占空比（ppm）
+ *   g_trk_edges     : EXTI 上升沿真实执行相位复位的次数（≈ 输入频率）
+ *   g_trk_edge_skip : 被 20us 去抖滤掉的沿（振铃/毛刺），正常应该一直是 0
+ */
+extern volatile uint32_t g_trk_edges;
+extern volatile uint32_t g_trk_edge_skip;
+extern volatile uint32_t g_trk_wave;
+extern volatile uint32_t g_trk_sq_ratio;
+extern volatile uint32_t g_trk_duty_ppm;
+extern volatile uint32_t g_trk_vmin;
+extern volatile uint32_t g_trk_vmax;
+
 /* ============================== 诊断计数（J-Link 可直接读）============================== */
 extern volatile uint32_t g_trk_measures;   /* 算出频率结果的次数 */
 extern volatile uint32_t g_trk_updates;    /* 真正调用 Signal_SetFreq() 的次数 */

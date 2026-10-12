@@ -95,6 +95,17 @@
  *   换频时波形无缝接上，**不再有相位台阶**（原因见下面 sine_fill_n 的说明）。
  * 元素类型必须是 uint32_t —— 和 DMA 的 Word 传输宽度严格一致。
  */
+/* ================== 多波形输出参数（2026-10-12 加，为"跟频+同波形+同电压+同相位"服务）==================
+ * ★ 这几个必须定义在 wave_fill_n() **之前** —— 表生成函数要用它们。
+ *   （原来工程里所有 static 状态都堆在 sine_fill_n 后面，加多波形时踩过一次编译错误。） */
+static uint8_t  s_wave_mode  = SIG_WAVE_SINE;
+static uint32_t s_vmin       = 0U;      /* 波形低电平码值（对方实测值直接搬过来） */
+static uint32_t s_vmax       = 4095U;   /* 波形高电平码值 */
+static float    s_duty       = 0.5f;    /* 方波占空比（高电平占比） */
+static float    s_phase_off  = 0.0f;    /* 相位微调，单位"周期"（= 度/360） */
+static uint8_t  s_phaselock  = 0U;      /* 1 = 锁相模式：表头恒为相位 0，配合 Signal_Realign() */
+static uint8_t  s_dirty      = 1U;      /* 波形/电平/占空比/相位 变了 → 下次必须重铺表 */
+
 static uint32_t sine_tab[SIN_MAX_POINTS];
 
 /**
@@ -145,9 +156,11 @@ static uint32_t sine_tab[SIN_MAX_POINTS];
   * @param  n      每周期点数
   * @param  phase0 起始相位，单位"周期"，任意实数（内部归一化到 [0,1)）
   */
-static void sine_fill_n(uint32_t n, float phase0)
+static void wave_fill_n(uint32_t n, float phase0)
 {
     uint32_t i;
+    float    lo = (float)s_vmin;
+    float    hi = (float)s_vmax;
 
     if (n < 2U)
     {
@@ -167,9 +180,45 @@ static void sine_fill_n(uint32_t n, float phase0)
 
     for (i = 0U; i < n; i++)
     {
-        /* 2*pi*(i/n + phase0) */
-        float ang = 6.28318530718f * ((float)i / (float)n + phase0);
-        float v   = 2048.0f + 2047.5f * sinf(ang);
+        /* 本点在一个周期里的位置，[0,1) */
+        float ph = (float)i / (float)n + phase0;
+        float v;
+
+        ph = ph - (float)((int32_t)ph);
+        if (ph < 0.0f)
+        {
+            ph += 1.0f;
+        }
+
+        switch (s_wave_mode)
+        {
+            case SIG_WAVE_SQUARE:
+                /* 方波：ph < duty 时是高电平。
+                 * ★ 表第 0 点（ph=0）就是高电平 = 上升沿所在位置，
+                 *   所以 Signal_Realign() 把 DMA 挪回表头时，
+                 *   输出的上升沿与对方的上升沿对齐。
+                 * 边沿陡度：DAC 一个更新周期一步到位，这是 DAC 物理上能做到的最陡，
+                 *   想再陡只能换定时器 PWM 输出（本工程不用，因为要同时支持正弦）。 */
+                v = (ph < s_duty) ? hi : lo;
+                break;
+
+            case SIG_WAVE_TRIANGLE:
+                /* 三角波：ph=0 从最低点开始上升，ph=0.5 到顶，ph=1 回到底 */
+                v = lo + (hi - lo) * ((ph < 0.5f) ? (ph * 2.0f) : (2.0f - ph * 2.0f));
+                break;
+
+            case SIG_WAVE_SAWTOOTH:
+                /* 上升锯齿：ph=0 从最低点线性升到最高点 */
+                v = lo + (hi - lo) * ph;
+                break;
+
+            case SIG_WAVE_SINE:
+            default:
+                /* 正弦：ph=0 在正中、且正在上升 —— 也就是"从负穿正的过零点"，
+                 * 与方波的上升沿在语义上对齐（都是"信号开始上升的那一刻"）。 */
+                v = (lo + hi) * 0.5f + (hi - lo) * 0.5f * sinf(6.28318530718f * ph);
+                break;
+        }
 
         if (v < 0.0f)
         {
@@ -327,7 +376,7 @@ static void signal_apply(void)
      *   代价：停表/重启会截断当前这个 TIM6 周期，相当于输出相位偏了不到
      *   1/N 个周期（N=1022 时是 0.1%），肉眼看不出；
      *   换来的是"换频不再冻结输出"，这个交换非常值。 */
-    if ((ch != NULL) && (s_live_n > 0U) && (s_npts == s_live_n))
+    if ((ch != NULL) && (s_live_n > 0U) && (s_npts == s_live_n) && (s_dirty == 0U))
     {
         __HAL_TIM_DISABLE(&htim6);
         __HAL_TIM_SET_PRESCALER(&htim6, s_psc);
@@ -348,16 +397,26 @@ static void signal_apply(void)
      *      只算 done/N 的话，等于假设表是从相位 0 开始的 ——
      *      而重铺过的表并不是。漏掉它的后果是每次重铺都跳一下，
      *      幅度最大可达满量程，正是我们要消掉的那个台阶。 */
-    if ((ch != NULL) && (s_live_n > 0U) && (ch->CNDTR <= s_live_n))
+    if (s_phaselock != 0U)
     {
-        uint32_t done = s_live_n - ch->CNDTR;
-
-        if (done < s_live_n)
-        {
-            phase0 = (float)done / (float)s_live_n;
-        }
+        /* ★ 锁相模式：表头必须恒等于"相位 0"，不能做相位连续 ★
+         *   因为 Signal_Realign() 每次把 DMA 挪回表头时，都假定表头就是
+         *   波形的上升沿位置。若这时表里烘焙着任意相位，复位后的相位就乱了。 */
+        phase0 = s_phase_off;
     }
-    phase0 += s_tab_phase;              /* 加上表里已有的相位偏移 */
+    else
+    {
+        if ((ch != NULL) && (s_live_n > 0U) && (ch->CNDTR <= s_live_n))
+        {
+            uint32_t done = s_live_n - ch->CNDTR;
+
+            if (done < s_live_n)
+            {
+                phase0 = (float)done / (float)s_live_n;
+            }
+        }
+        phase0 += s_tab_phase;          /* 加上表里已有的相位偏移 */
+    }
 
     /* 1) 先掐掉触发源，避免改配置的过程中有半截触发进来 */
     __HAL_TIM_DISABLE(&htim6);
@@ -377,8 +436,9 @@ static void signal_apply(void)
      *   不能只在 N 变化时铺 —— 因为相位每刻都在变。
      *   代价是每次换频多 N 次 sinf()（N 最大 1024，约几十微秒），
      *   换来的是换频时输出**没有任何台阶**，这个交换在跟频场景下非常值。 */
-    sine_fill_n(s_npts, phase0);
+    wave_fill_n(s_npts, phase0);
     s_live_n = s_npts;
+    s_dirty  = 0U;
 
     /* 把归一化后的相位记下来，下次重铺要加上它（见步骤 0） */
     s_tab_phase = phase0 - (float)((int32_t)phase0);
@@ -507,7 +567,7 @@ void Signal_Init(void)
         return;                         /* 防止重复初始化 */
     }
     s_running = 1U;
-    sine_fill_n(SIN_MAX_POINTS, 0.0f);  /* 先铺一张满表（相位 0），SetFreq 里会按 N 重铺 */
+    wave_fill_n(SIN_MAX_POINTS, 0.0f);  /* 先铺一张满表（相位 0），SetFreq 里会按 N 重铺 */
     s_psc     = 0U;
     s_arr     = 0U;
     s_npts    = 1024U;
@@ -636,4 +696,150 @@ uint32_t Signal_GetPoints(void)
 uint32_t *Signal_GetTable(void)
 {
     return sine_tab;
+}
+
+/* ==================== 多波形 / 电平 / 相位 接口（2026-10-12 加）====================
+ *
+ * 这一组是为了"跟频 + 同波形 + 同电压 + 同相位"服务的：
+ *   波形  -> Signal_SetWave()    方波/正弦/三角/锯齿
+ *   电压  -> Signal_SetLevels()  直接把对方实测的低/高电平码值搬过来
+ *   相位  -> Signal_SetPhaseLock() + Signal_Realign()  （由输入上升沿触发）
+ *
+ * 每个 setter 都遵循同一套流程：
+ *   参数真的变了 → 置 s_dirty → 立刻 signal_apply()
+ * signal_apply() 看到 s_dirty 就会走慢路径重铺表；s_dirty==0 且点数没变时走快路径，
+ * 只动 TIM6 的 PSC/ARR（几微秒，不冻结输出）。
+ */
+
+void Signal_SetWave(uint8_t mode)
+{
+    if (s_wave_mode != mode)
+    {
+        s_wave_mode = mode;
+        s_dirty     = 1U;
+        if (s_running != 0U)
+        {
+            signal_apply();
+        }
+    }
+}
+
+void Signal_SetLevels(uint32_t vmin, uint32_t vmax)
+{
+    uint32_t t;
+
+    if (vmin > 4095U) { vmin = 4095U; }
+    if (vmax > 4095U) { vmax = 4095U; }
+    if (vmin > vmax)                            /* 容错：传反了也认 */
+    {
+        t    = vmin;
+        vmin = vmax;
+        vmax = t;
+    }
+
+    if ((s_vmin != vmin) || (s_vmax != vmax))
+    {
+        s_vmin  = vmin;
+        s_vmax  = vmax;
+        s_dirty = 1U;
+        if (s_running != 0U)
+        {
+            signal_apply();
+        }
+    }
+}
+
+void Signal_SetDuty(float duty)
+{
+    if (duty < 0.01f) { duty = 0.01f; }
+    if (duty > 0.99f) { duty = 0.99f; }
+
+    if (fabsf(duty - s_duty) > 0.0005f)
+    {
+        s_duty  = duty;
+        s_dirty = 1U;
+        if (s_running != 0U)
+        {
+            signal_apply();
+        }
+    }
+}
+
+void Signal_SetPhaseDeg(float deg)
+{
+    float p = deg * (1.0f / 360.0f);
+
+    p = p - (float)((int32_t)p);
+    if (p < 0.0f)
+    {
+        p += 1.0f;
+    }
+
+    if (fabsf(p - s_phase_off) > 0.0002f)
+    {
+        s_phase_off = p;
+        s_dirty     = 1U;
+        if (s_running != 0U)
+        {
+            signal_apply();
+        }
+    }
+}
+
+void Signal_SetPhaseLock(uint8_t on)
+{
+    uint8_t v = (on != 0U) ? 1U : 0U;
+
+    if (s_phaselock != v)
+    {
+        s_phaselock = v;
+        s_dirty     = 1U;
+        if (s_running != 0U)
+        {
+            signal_apply();
+        }
+    }
+}
+
+uint8_t Signal_GetWave(void)
+{
+    return s_wave_mode;
+}
+
+void Signal_Realign(void)
+{
+    DMA_Channel_TypeDef *ch;
+
+    if ((s_running == 0U) || (s_live_n == 0U) || (hdac3.DMA_Handle1 == NULL))
+    {
+        return;
+    }
+    ch = (DMA_Channel_TypeDef *)hdac3.DMA_Handle1->Instance;
+
+    /* ---- 1) 停表：此刻起输出冻结，到重新起振大约 1~2us ---- */
+    __HAL_TIM_DISABLE(&htim6);
+
+    /* ---- 2) 关 DMA 请求 + 通道，清标志（绕开 HAL_DAC_Stop_DMA，见 signal_apply 坑 1）---- */
+    DAC3->CR &= ~DAC_CR_DMAEN1;
+    ch->CCR  &= ~DMA_CCR_EN;
+    DMA1->IFCR = 0x0FUL;                        /* 只清 DMA1 通道1 的中断标志 */
+    DAC3->SR   = DAC_SR_DMAUDR1;
+
+    /* ---- 3) 指针拉回表头。表头 = 相位0 = 上升沿，见 SIG_WAVE_xxx 的约定 ---- */
+    ch->CPAR  = (uint32_t)&(DAC3->DHR12R1);
+    ch->CMAR  = (uint32_t)sine_tab;
+    ch->CNDTR = s_live_n;
+    ch->CCR  |= DMA_CCR_EN;
+
+    DAC3->DHR12R1 = sine_tab[0];                /* 预置成表头值（方波就是高电平） */
+
+    /* ---- 4) ★ 把 CNT 直接设成 ARR，让第一次 Update 在下一个时钟就发生 ★
+     *   如果这里老老实实 CNT=0，第一次触发要等 (ARR+1) 个时钟 = 一个 DAC 更新周期
+     *   （N=1024 时约 6us），那就成了一个固定的相位滞后，白白浪费精度。
+     *   设成 ARR 后，下一个 tick(5.9ns) 就溢出 → 产生 TRGO → DAC 立刻输出表头点，
+     *   所以"检测到对方的沿"到"我们的沿"之间的延迟基本只剩下中断响应时间。 */
+    htim6.Instance->EGR = TIM_EGR_UG;           /* 先把 PSC/ARR 影子寄存器刷新成新值 */
+    __HAL_TIM_SET_COUNTER(&htim6, s_arr);       /* 再顶到 ARR，准备好立刻溢出 */
+    DAC3->CR |= DAC_CR_DMAEN1;
+    __HAL_TIM_ENABLE(&htim6);
 }

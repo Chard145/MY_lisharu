@@ -96,6 +96,28 @@
 #define TRK_FREQ_LO         (SIGNAL_FREQ_MIN * 0.5f)
 #define TRK_FREQ_HI         (SIGNAL_FREQ_MAX * 1.5f)
 
+/* ==================== 波形识别 / 电平搬运 / 相位对齐 参数 ==================== */
+
+/* "贴轨"判据的带宽：峰峰值 / 这个数。5 → 上下各 20%。
+ * 各波形落在轨道带里的样本比例（理论值）：
+ *     方波   ~100%（除边沿）      三角  20%      正弦  41%
+ * 所以阈值取 0.70 能把方波干净地分出来。 */
+#define TRK_RAIL_BAND_DIV   5
+#define TRK_SQUARE_RATIO    0.70f
+
+/* 每这么多样本判一次波形类型（500kSPS 下 4096 点 ≈ 8.2ms，够快也不至于抖） */
+#define TRK_DETECT_LEN      4096U
+
+/* EXTI 去抖：两次上升沿至少间隔这么多 CPU 周期（170MHz 下 3400 ≈ 20us）。
+ * 方波的半周期远大于 20us，所以正常信号不会被误滤掉，
+ * 但对方边沿上的振铃/毛刺不会连触发好几次。 */
+#define TRK_EDGE_GUARD_CYC  3400U
+
+/* 电平/波形参数只在变化超过这些阈值时才真正写进 signal.c ——
+ * 因为每次写都可能触发重铺表（0.5ms 冻结输出），不能让它跟着包络抖动乱写。 */
+#define TRK_LEVEL_EPS       16U      /* 电平码值变化超过 16 才更新 */
+#define TRK_DUTY_EPS        0.01f    /* 占空比变化超过 1% 才更新 */
+
 /* ============================== 开环测试模式 ==============================
  * ★★ 为什么需要这个开关：自监控闭环会失控 ★★
  *
@@ -130,6 +152,15 @@ volatile uint32_t g_trk_pk       = 0U;
 volatile uint32_t g_trk_resets   = 0U;
 volatile uint32_t g_trk_samples  = 0U;
 
+/* ---- 波形匹配 / 相位对齐 诊断 ---- */
+volatile uint32_t g_trk_edges    = 0U;   /* EXTI 上升沿中断实际执行 Realign 的次数 */
+volatile uint32_t g_trk_edge_skip= 0U;   /* 被去抖滤掉的沿（振铃/毛刺） */
+volatile uint32_t g_trk_wave     = 0U;   /* 识别出的波形：0=正弦 1=三角 2=方波 */
+volatile uint32_t g_trk_sq_ratio = 0U;   /* 贴轨样本比例 ×1000（方波≈1000，正弦≈410） */
+volatile uint32_t g_trk_duty_ppm = 0U;   /* 对方方波占空比，单位 ppm */
+volatile uint32_t g_trk_vmin     = 0U;   /* 对方低电平码值（直接搬给 DAC 用） */
+volatile uint32_t g_trk_vmax     = 0U;   /* 对方高电平码值 */
+
 /* ============================== 内部状态 ============================== */
 
 static uint32_t s_rd;               /* 已处理到的缓冲下标 */
@@ -157,6 +188,32 @@ static float    s_out_hz;           /* 低通后的输出频率 */
 static float    s_set_hz;           /* 上次真正设给 DAC 的值 */
 static uint8_t  s_have_out;         /* 输出频率是否已建立 */
 static uint32_t s_last_upd_ms;      /* 上次 SetFreq 的时刻 */
+
+/* ---------- 波形识别 / 电平搬运 / 相位对齐 的内部状态 ---------- */
+static uint32_t s_lo_rail;          /* 当前统计窗里贴**下轨**的样本数 */
+static uint32_t s_hi_rail;          /* 当前统计窗里贴**上轨**的样本数 */
+static uint32_t s_win_cnt;          /* 当前统计窗里的总样本数 */
+static uint32_t s_hi_cnt;           /* 自上个上升沿以来大于 dc 的样本数 */
+static uint32_t s_lo_cnt;           /* 自上个上升沿以来小于 dc 的样本数 */
+static uint8_t  s_duty_done;        /* 占空比是否已经测到过一次 */
+static float    s_duty = 0.5f;      /* 平滑后的占空比 */
+static uint8_t  s_detected_wave = SIG_WAVE_SINE;
+
+static uint32_t s_last_edge_cyc;    /* 上次 EXTI 的时刻（DWT 周期计数，用于去抖） */
+static uint8_t  s_edge_inited;
+static uint8_t  s_phaselock_on;     /* 1 = 允许 EXTI 去复位输出相位（有有效信号时才开） */
+
+static uint8_t  s_app_valid;        /* 下面几个"已经写进 signal.c 的值"是否有效 */
+static uint32_t s_app_vmin;
+static uint32_t s_app_vmax;
+static uint8_t  s_app_wave = 0xFFU;
+static float    s_app_duty = -1.0f;
+
+/* 前置声明：这三个函数定义在 trk_feed / trk_maybe_measure 之后，
+ * 但它们要被前面的函数调用，所以必须先声明，否则编译器按隐式声明处理会报错。 */
+static void trk_duty_update(void);
+static void trk_wave_detect(void);
+static void trk_apply_waveform(void);
 
 /* ============================== 内部函数 ============================== */
 
@@ -235,6 +292,8 @@ static void trk_env_update(void)
             g_trk_resets++;
         }
         g_trk_valid = 0U;
+        s_phaselock_on = 0U;            /* ★ 没信号时禁止 EXTI 复位相位 ★
+                                         *   否则悬空脚的噪声会不停地把输出波形打断成碎片。 */
         trk_clear_meas();
         return;
     }
@@ -259,7 +318,8 @@ static void trk_env_update(void)
         }
     }
 
-    g_trk_valid = 1U;
+    g_trk_valid    = 1U;
+    s_phaselock_on = 1U;                /* 确认有有效信号了，才允许 EXTI 复位输出相位 */
 }
 
 /**
@@ -339,6 +399,10 @@ static void trk_maybe_measure(void)
         return;
     }
 
+    /* ---- 同波形 / 同电压 / 同占空比：把对方的参数搬给 DAC ----
+     * 放在频率处理之前：波形和电平是"慢变量"，先更新它们，后面的换频才能基于新表算。 */
+    trk_apply_waveform();
+
     /* ---- 第二级：换频检测 / 一阶低通 ---- */
     if (s_have_out == 0U)
     {
@@ -400,6 +464,30 @@ static void trk_feed(uint32_t g, uint16_t raw)
         trk_env_update();               /* 慢放 + 重算 dc/hyst/valid */
     }
 
+    /* ---- 波形识别用的"贴轨"统计 + 占空比用的高低计数 ----
+     * ★ 上轨和下轨要**分开**统计 ★
+     *   一开始只统计"贴任意一轨"的总比例，结果输入是恒定电平时（只有上轨有样本）
+     *   比例算出来是 1000‰，被误判成方波 —— 实测踩到过，对方信号一断，
+     *   输出就悄悄从正弦变成了方波。
+     *   方波的特征是"上下两轨都有大量样本"，所以判据取 min(上轨比, 下轨比)。 */
+    if (s_have_dc != 0U)
+    {
+        int32_t pk   = s_env_max - s_env_min;
+        int32_t band = pk / TRK_RAIL_BAND_DIV;
+
+        if (pk >= TRK_MIN_PK)
+        {
+            if (v <= (s_env_min + band)) { s_lo_rail++; }
+            if (v >= (s_env_max - band)) { s_hi_rail++; }
+            s_win_cnt++;
+
+            /* 占空比：从这次上升沿到下次上升沿之间，高/低电平各占多少样本 */
+            if (v > s_dc) { s_hi_cnt++; }
+            else          { s_lo_cnt++; }
+        }
+    }
+    trk_wave_detect();
+
     /* ---- 上升沿过零检测（迟滞 + 武装）---- */
     if (s_have_dc != 0U)
     {
@@ -421,6 +509,7 @@ static void trk_feed(uint32_t g, uint16_t raw)
                 if (frac < 0.0f) { frac = 0.0f; }
                 if (frac > 1.0f) { frac = 1.0f; }
 
+                trk_duty_update();      /* 一个周期刚走完，先结算占空比 */
                 trk_push_cross(s_prev_g, frac);
                 trk_maybe_measure();
             }
@@ -430,6 +519,208 @@ static void trk_feed(uint32_t g, uint16_t raw)
 
     s_prev   = v;
     s_prev_g = g;
+}
+
+/* ==================== 波形识别 / 电平搬运 / 相位对齐 ====================
+ *
+ * 目标：输出与对方"同频 + 同波形 + 同电压 + 同相位"。
+ *
+ *   同频   —— 已有：上升沿过零插值跟踪器（开环标定实测误差 0.004%）
+ *   同波形 —— 统计"贴在上下轨附近的样本比例"区分方波 / 正弦
+ *   同电压 —— 把包络量出来的对方低/高电平码值**原样**交给 Signal_SetLevels()，
+ *             不做任何归一化、不做缩放，所以 DAC 输出的电压范围与对方逐码一致
+ *   同相位 —— ★核心★ PB15 一芯两用：既做 ADC2_IN15 又做 EXTI15 上升沿中断
+ *
+ * 为什么一根线都不用多加（关键事实，已查过手册与引脚表）：
+ *   STM32 的 ADC 输入是 pad 直连的**模拟通路**，EXTI 走的是 pad → 施密特触发器
+ *   的**数字通路**，两条路在芯片内部是分开的。GPIO 的 MODER 只影响数字那一条，
+ *   所以把 PB15 从 GPIO_MODE_ANALOG 改成 GPIO_MODE_IT_RISING 之后，
+ *   ADC2_IN15 照样能采到对方波形，同时还白得一个"上升沿到达"的中断事件。
+ *
+ * 相位精度：EXTI 中断响应 + Signal_Realign() 共约 1~2us，抖动约 0.5us。
+ *   150Hz 时相位误差 ≈ 0.5us/6.67ms × 360° ≈ 0.03°，再算上 2us 的固定延迟
+ *   （可用 Signal_SetPhaseDeg() 补掉）也远小于 1°。
+ *   对李萨如图形演示来说绰绰有余。想更高只能把对方信号再引一根线到
+ *   TIM 捕获脚走硬件从模式，并且要把 DAC 触发源从 TIM6 换成 TIM2_TRGO，
+ *   需要改 CubeMX —— 代价大、收益小，本工程不做。
+ */
+
+/**
+  * @brief  把 PB15 同时配成 ADC 输入 + EXTI15 上升沿中断
+  * @note   ⚠️ 必须在 MX_ADC2_Init() **之后**调用 ——
+  *         HAL_ADC_MspInit() 会把 PB15 设成 GPIO_MODE_ANALOG，本函数要覆盖它。
+  */
+static void trk_exti_init(void)
+{
+    GPIO_InitTypeDef gi = {0};
+
+    gi.Pin   = GPIO_PIN_15;
+    gi.Mode  = GPIO_MODE_IT_RISING;     /* 数字输入 + 上升沿中断（ADC 模拟通路不受影响） */
+    gi.Pull  = GPIO_NOPULL;
+    gi.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &gi);
+
+    /* DWT 周期计数器：给 EXTI 去抖用（精度 5.9ns，比 HAL_GetTick 的 1ms 精确得多） */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0U;
+    DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+
+    s_edge_inited   = 0U;
+    s_last_edge_cyc = 0U;
+
+    /* 优先级给最高（0）：相位对齐的抖动直接取决于这个中断能多快进来，
+     * 被别的高优先级中断挡住多久，相位就偏多久。 */
+    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0U, 0U);
+    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+
+/**
+  * @brief  对方信号上升沿中断 —— 相位对齐的执行点
+  * @note   中断里只做寄存器操作（不重铺表），耗时 1~2us。
+  *         输入 150Hz 时每秒 150 次，CPU 占用可忽略。
+  */
+void EXTI15_10_IRQHandler(void)
+{
+    if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_15) != 0U)
+    {
+        __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_15);
+
+        if (s_phaselock_on != 0U)
+        {
+            uint32_t now = DWT->CYCCNT;
+
+            /* 去抖：两次沿靠得太近就判为振铃/毛刺。
+             * 方波半周期远大于 20us，正常信号不会误滤。 */
+            if ((s_edge_inited != 0U) &&
+                ((uint32_t)(now - s_last_edge_cyc) < TRK_EDGE_GUARD_CYC))
+            {
+                g_trk_edge_skip++;
+            }
+            else
+            {
+                s_last_edge_cyc = now;
+                s_edge_inited   = 1U;
+
+                Signal_Realign();       /* ★ 把输出相位硬拉回上升沿 ★ */
+                g_trk_edges++;
+            }
+        }
+    }
+}
+
+/**
+  * @brief  一个完整周期结束（检测到上升沿）时更新占空比
+  */
+static void trk_duty_update(void)
+{
+    uint32_t tot = s_hi_cnt + s_lo_cnt;
+
+    if (tot > 8U)
+    {
+        float d = (float)s_hi_cnt / (float)tot;
+
+        if (s_duty_done == 0U)
+        {
+            s_duty      = d;
+            s_duty_done = 1U;
+        }
+        else
+        {
+            s_duty += 0.25f * (d - s_duty);     /* 一阶低通 */
+        }
+        g_trk_duty_ppm = (uint32_t)(s_duty * 1000000.0f);
+    }
+
+    s_hi_cnt = 0U;
+    s_lo_cnt = 0U;
+}
+
+/**
+  * @brief  每 TRK_DETECT_LEN 个样本判一次波形类型
+  * @note   判据 = min(贴下轨比例, 贴上轨比例)，带宽是包络上下各 20%：
+  *             方波  上下轨各 ≈500‰  → min ≈ 500   → 判为方波
+  *             正弦  |x|>0.8 各 ≈205‰ → min ≈ 205   → 判为正弦
+  *             三角  各 ≈100‰        → min ≈ 100   → 判为正弦
+  *             恒定电平  只有一轨有样本 → min ≈ 0   → 判为正弦（不会误判成方波）
+  *         阈值 0.35 (350‰) 能干净地把方波分出来，三种波形都成立。
+  *
+  * ★ 为什么必须取 min 而不是"总贴轨比例" ★
+  *   只统计总数时，输入恒为高电平时所有样本都贴在上轨，比例 1000‰ → 误判成方波。
+  *   实测踩过：对方信号一断，输出就从正弦悄悄变成方波，而且看不出来。
+  */
+static void trk_wave_detect(void)
+{
+    if (s_win_cnt >= TRK_DETECT_LEN)
+    {
+        uint32_t r_lo = (s_lo_rail * 1000U) / s_win_cnt;
+        uint32_t r_hi = (s_hi_rail * 1000U) / s_win_cnt;
+        uint32_t r    = (r_lo < r_hi) ? r_lo : r_hi;
+
+        g_trk_sq_ratio  = r;
+        s_detected_wave = (r >= (uint32_t)(TRK_SQUARE_RATIO * 1000.0f))
+                        ? SIG_WAVE_SQUARE
+                        : SIG_WAVE_SINE;
+        g_trk_wave = (uint32_t)s_detected_wave;
+
+        s_lo_rail = 0U;
+        s_hi_rail = 0U;
+        s_win_cnt = 0U;
+    }
+}
+
+/**
+  * @brief  把"同波形 + 同电压 + 同占空比"真正写进 signal.c
+  * @note   每个参数都加了变化阈值：因为写下去可能触发重铺表（0.5ms 冻结输出），
+  *         不能让它们跟着包络抖动反复写。
+  */
+static void trk_apply_waveform(void)
+{
+    uint32_t vmin = (s_env_min > 0) ? (uint32_t)s_env_min : 0U;
+    uint32_t vmax = (s_env_max > 0) ? (uint32_t)s_env_max : 0U;
+    uint8_t  need_lv = 0U;
+
+    g_trk_vmin = vmin;
+    g_trk_vmax = vmax;
+
+    /* ---- 电压：对方低/高电平码值直接搬过去 ---- */
+    if (s_app_valid == 0U)
+    {
+        need_lv = 1U;
+    }
+    else
+    {
+        uint32_t d1 = (vmin > s_app_vmin) ? (vmin - s_app_vmin) : (s_app_vmin - vmin);
+        uint32_t d2 = (vmax > s_app_vmax) ? (vmax - s_app_vmax) : (s_app_vmax - vmax);
+
+        if ((d1 > TRK_LEVEL_EPS) || (d2 > TRK_LEVEL_EPS))
+        {
+            need_lv = 1U;
+        }
+    }
+    if (need_lv != 0U)
+    {
+        Signal_SetLevels(vmin, vmax);
+        s_app_vmin  = vmin;
+        s_app_vmax  = vmax;
+        s_app_valid = 1U;
+    }
+
+    /* ---- 波形类型 ---- */
+    if (s_detected_wave != s_app_wave)
+    {
+        Signal_SetWave(s_detected_wave);
+        s_app_wave = s_detected_wave;
+    }
+
+    /* ---- 占空比（只对方波有意义）---- */
+    if ((s_detected_wave == SIG_WAVE_SQUARE) && (s_duty_done != 0U))
+    {
+        if (fabsf(s_duty - s_app_duty) > TRK_DUTY_EPS)
+        {
+            Signal_SetDuty(s_duty);
+            s_app_duty = s_duty;
+        }
+    }
 }
 
 /* ============================== 对外接口 ============================== */
@@ -481,6 +772,28 @@ void Track_Init(void)
             (void)buf[i];
         }
     }
+
+    /* ---- 波形匹配 / 相位对齐 的状态复位 ---- */
+    s_lo_rail     = 0U;
+    s_hi_rail     = 0U;
+    s_win_cnt     = 0U;
+    s_hi_cnt      = 0U;
+    s_lo_cnt      = 0U;
+    s_duty_done   = 0U;
+    s_duty        = 0.5f;
+    s_detected_wave = SIG_WAVE_SINE;
+    s_phaselock_on  = 0U;
+    s_app_valid     = 0U;
+    s_app_vmin      = 0U;
+    s_app_vmax      = 0U;
+    s_app_wave      = 0xFFU;
+    s_app_duty      = -1.0f;
+
+    /* ★ 让 signal.c 进入锁相模式：表头恒为相位 0，Signal_Realign() 才有意义 ★ */
+    Signal_SetPhaseLock(1U);
+
+    /* ★ PB15 一芯两用：既做 ADC2_IN15 又做 EXTI15 上升沿中断（必须在 ADC 初始化之后）★ */
+    trk_exti_init();
 }
 
 void Track_Poll(void)
