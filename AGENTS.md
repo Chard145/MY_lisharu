@@ -451,7 +451,9 @@ JLink.exe -CommanderScript flash.jlink    # 烧录前先关 RTT 桥
 `build\Debug\project.hex` 必须和 `project.elf` 同一时刻。
 `project.hex`（根目录）已作废，不要再生成。
 
+---
 
+## 8. 相关技能
 
 - `jlink-rtt-bridge` —— RTT / J-Scope / VOFA+ 传数据的完整用法与本机现场记忆。
 - `scope-sds1052a` —— 示波器读数（LeCroy 老式命令集，不是标准 SCPI）。
