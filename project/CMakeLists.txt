@@ -50,11 +50,23 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/signal.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/signal_slow.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/uart_echo.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/adc_vofa.c
+
+    # SEGGER RTT 调试输出（走 SWD 内存轮询，不占 UART / 引脚）
+    # ★ 放在 Port/ 而不是 Middlewares/ —— CubeMX 重新生成时会把 Middlewares/
+    #   整个删掉（2026-10-12 实测，RTT 中间件被清空导致工程编译不过）。
+    ${CMAKE_CURRENT_SOURCE_DIR}/Port/debug_rtt.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Port/SEGGER_RTT/SEGGER_RTT.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Port/SEGGER_RTT/SEGGER_RTT_printf.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Port/SEGGER_RTT/SEGGER_RTT_ASM_ARMv7M.S
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
+    ${CMAKE_CURRENT_SOURCE_DIR}/Port
+    ${CMAKE_CURRENT_SOURCE_DIR}/Port/SEGGER_RTT
 )
 
 # Add project symbols (macros)

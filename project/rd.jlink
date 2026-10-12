@@ -1,0 +1,8 @@
+si SWD
+speed 4000
+device STM32G431C8
+connect
+h
+mem32 0x2000299C, 11
+g
+qc

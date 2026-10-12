@@ -1,16 +1,25 @@
 /**
   ******************************************************************************
   * @file    signal.h
-  * @brief   DAC + TIM6 + DMA 循环 → 持续正弦波，频率 20Hz~20kHz 可调（PA4 输出）
+  * @brief   DAC3 + TIM6 + DMA 循环 + 内部运放 → 持续正弦波（PA2 输出）
   *
   * 用法（main.c 的 USER CODE 区）：
-  *      Signal_Init();            // 放在 MX_DAC1_Init()/MX_TIM6_Init() 之后调一次
+  *      Signal_Init();            // 放在 MX_DAC3_Init()/MX_TIM6_Init() 之后调一次
   *      Signal_SetFreq(1000.0f);  // 随时改频率，单位 Hz
+  *      HAL_OPAMP_Start(&hopamp1);// ★ 必须在 Signal_Init() 之后（CubeMX 不生成这行）
   *
   * 依赖（全部由 CubeMX 生成，勿手改）：
-  *      dac.c : hdac1 / hdma_dac1_ch1, DAC1_CH1, DAC_TRIGGER_T6_TRGO,
-  *              DMA1_Channel1 = Circular + Word + MemInc, PA4 = DAC1_OUT1
-  *      tim.c : htim6, TRGO = Update Event, AutoReloadPreload = ENABLE
+  *      dac.c   : hdac3 / hdma_dac3_ch1, DAC3_CH1, DAC_TRIGGER_T6_TRGO,
+  *                DMA1_Channel1 = Circular + Word + MemInc
+  *                DAC3 的 OUT1 mode = "on chip-peripherals only"（无引脚）
+  *      opamp.c : hopamp1 = Follower + NonInvertingInput=DAC + HighSpeed, PA2 = OPAMP1_VOUT
+  *      tim.c   : htim6, TRGO = Update Event, AutoReloadPreload = ENABLE
+  *
+  * ★ 为什么是 DAC3 而不是 DAC1 ★
+  *   STM32G4 的运放内部直连只支持 DAC3/DAC4，DAC1/DAC2 不参与（CubeMX 芯片库
+  *   原文：OPAMP1 的条件是 "Only active when DAC3 channel out1 is enabled"）。
+  *   而 G431(LQFP48) 上 DAC3 没有任何外部引脚 —— 它就是专为运放准备的内部 DAC。
+  *   通路：DAC3_OUT1 ─(片内)─> OPAMP1_VINP ─> OPAMP1 跟随器 ─> PA2
   *
   * 注意：本工程 TIM6 时钟 = 170MHz（APB1 分频 = 1）。
   *       若日后改主频，必须同步改 signal.c 里的 TIM6_CLK_HZ。
@@ -80,6 +89,15 @@ void            Signal_Measure(void);
   *         还是半波/1/4 波。实现见 signal_slow.c（诊断完可删）。
   */
 void            Signal_SlowTest(void);
+
+/**
+  * @brief  4Hz~700Hz 扫频（非阻塞版）
+  * @note   Signal_Sweep_Init() 在 USER CODE BEGIN 2 里调一次，
+  *         Signal_Sweep_Step() 在主循环里反复调，到时间自动换档。
+  *         这样扫频可以和串口回发等其它任务共存。实现见 signal_slow.c。
+  */
+void            Signal_Sweep_Init(void);
+void            Signal_Sweep_Step(void);
 
 /**
   * @brief  【临时诊断】带记录点的启动流程，把每步返回值写到 g_trace[]

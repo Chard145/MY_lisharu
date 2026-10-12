@@ -18,14 +18,20 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
 #include "dac.h"
 #include "dma.h"
+#include "opamp.h"
 #include "tim.h"
+#include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "signal.h"          /* DAC+TIM6+DMA  */
+#include "uart_echo.h"       /* USART1 不定长收发（DMA + 空闲中断） */
+#include "adc_vofa.h"        /* ADC2(20kHz, TIM7触发) -> VOFA+ (JustFloat) */
+#include "debug_rtt.h"       /* SEGGER RTT 调试输出（走 SWD，不占 UART/引脚） */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -90,15 +96,45 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_DAC1_Init();
   MX_TIM6_Init();
+  MX_USART1_UART_Init();
+  MX_ADC2_Init();
+  MX_TIM7_Init();
+  MX_DAC3_Init();
+  MX_OPAMP1_Init();
   /* USER CODE BEGIN 2 */
-  /* Start the sine output: default 1 kHz on PA4.
-   * Must be called AFTER MX_DAC1_Init() / MX_TIM6_Init() -- the calls above
-   * already ran in the order MX_GPIO_Init, MX_DMA_Init, MX_DAC1_Init, MX_TIM6_Init.
-   * To change the frequency at any time: Signal_SetFreq(<Hz>),
-   * e.g. Signal_SetFreq(20000.0f); */
-  Signal_Trace();   /* DIAG: fixed 50Hz. Restore Signal_Init() when done. */
+  /* RTT 调试通道：越早初始化越好，这样后面所有 printf 都能被 J-Link 抓走。
+   * 不需要任何接线改动（走原有 SWD：PA13/PA14），也不占 USART。 */
+  Debug_RTT_Init();
+  Debug_RTT_Println("boot: RTT ready, init peripherals...");
+
+  /* Start the sine output. 通路：DAC3 ─(片内)─> OPAMP1 跟随器 ─> PA2
+   *
+   * ★ 只有一件事必须自己做：CubeMX 只生成 MX_OPAMP1_Init()，**不会生成启动**。
+   *   HAL_OPAMP_Init() 的源码注释写得很清楚：
+   *       "(#) Enable the OPAMP using HAL_OPAMP_Start() function."
+   *   Init 只把参数写进 OPAMP_CSR，运放本体还是关着的 → PA2 上什么都没有。
+   *
+   * ★ 顺序：HAL_OPAMP_Start() 必须在 Signal_Init() 之后 ——
+   *   DAC3 要先跑起来，运放跟随的才不是 0V。
+   *
+   * 注：G4 的 OPAMP 没有独立时钟门控（CubeMX 里该 IP 是 ClockEnableMode="none"，
+   *     芯片头文件里也没有 __HAL_RCC_OPAMP_CLK_ENABLE 这个宏），所以不需要开时钟。 */
+  Signal_Sweep_Init();          /* 启动 4Hz~700Hz 扫频（非阻塞），内部会起 DAC3 */
+  HAL_OPAMP_Start(&hopamp1);    /* ★ 运放启动：必须晚于 DAC3 */
+
+  Uart_Echo_Init();             /* 启动 USART1 不定长接收（DMA + 空闲中断） */
+  Adc_Vofa_Init();              /* 启动 ADC2 采集(20kHz) + DMA，准备发 VOFA+ */
+  Debug_RTT_Println("boot: all modules started");
+
+  /* ---- RTT 调试输出用法（不需要时可删）---------------------------------
+   * printf 已被重定向到 RTT，J-Link RTT Viewer 里直接能看到：
+   *     printf("angle=%d  id=%.3f  iq=%.3f\r\n", (int)angle, id, iq);
+   *     Debug_RTT_Printf("freq=%.2f Hz\r\n", Signal_GetFreq());
+   * 注意：别在 20kHz 中断里刷屏，缓冲满了会静默丢弃
+   *       （可用 g_rtt_dropped 查看丢了多少）。
+   * -------------------------------------------------------------------- */
+  printf("RTT printf OK: %d %.3f\r\n", 42, 3.14159f);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -108,6 +144,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    Signal_Sweep_Step();        /* 扫频推进（非阻塞，到时间才换档） */
+    Uart_Echo_Poll();           /* 串口轮询：每 2ms 取走 DMA 收到的数据并回发 */
+    Adc_Vofa_Poll();            /* ADC 轮询：取一整窗波形降采样后发到 VOFA+ 示波器 */
+    /* 串口收发由 DMA + 空闲中断在后台完成，主循环不用管 */
   }
   /* USER CODE END 3 */
 }
