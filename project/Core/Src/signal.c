@@ -105,6 +105,11 @@ static float    s_duty       = 0.5f;    /* 方波占空比（高电平占比） 
 static float    s_phase_off  = 0.0f;    /* 相位微调，单位"周期"（= 度/360） */
 static uint8_t  s_phaselock  = 0U;      /* 1 = 锁相模式：表头恒为相位 0，配合 Signal_Realign() */
 static uint8_t  s_dirty      = 1U;      /* 波形/电平/占空比/相位 变了 → 下次必须重铺表 */
+static uint32_t s_last_realign_ms = 0U; /* 上次 Signal_Realign() 的时刻，用于超时兜底 */
+
+/* 超过这么久没有 Realign（对方信号断了？）就把挂起的改动立刻落地，
+ * 免得参数永远悬着不生效。见 signal_apply() 里锁相模式那段。 */
+#define SIGNAL_REALIGN_TIMEOUT_MS   200U
 
 static uint32_t sine_tab[SIN_MAX_POINTS];
 
@@ -387,6 +392,32 @@ static void signal_apply(void)
         return;
     }
 
+    /* ==================== ★★★ 锁相模式：把改动推迟到下一次 Signal_Realign() ★★★ ====================
+     *
+     * ★ 为什么必须这么做（2026-10-12 用户报的"偶发相位错乱"）★
+     *
+     *   下面的慢路径会做三件事：重铺整张表 → 把 DMA 挪回表头 → 把输出拉到 sine_tab[0]。
+     *   最后一步等于**强行把输出相位归零**。而表头是"相位 0"（方波是跳变到高、
+     *   正弦是上升过零点）—— 所以**只要这件事发生在周期中间，输出就突然跳一次相**。
+     *
+     *   什么时候会触发？波形/电平/占空比变化时（节流后最多 4 次/秒），
+     *   以及换 N（点数）时。对用户来说就是"很少，但明显"的相位错乱。
+     *
+     *   ★ 关键洞察：相位归零这个动作**本身没错，错的是时机**。
+     *     它应该只发生在 Signal_Realign() 里 —— 那一刻正是对方的上升沿，
+     *     输出本来就该从相位 0 重新开始，归零完全正确、看不出任何跳变。
+     *
+     *   所以锁相模式下这里什么都不做，只把改动挂起（s_dirty 已经是 1），
+     *   等下一次 Signal_Realign() 一次性落地。这就是"表可以慢、但归零只在对的节拍上"。
+     *
+     *   ⚠️ 唯一的风险：如果对方信号断了、再也没有 Realign，改动就永远悬着。
+     *      所以加一个超时兜底：太久没 Realign（默认 200ms）就走正常流程立刻落地。 */
+    if ((s_phaselock != 0U) && (s_running != 0U)
+        && ((uint32_t)(HAL_GetTick() - s_last_realign_ms) < SIGNAL_REALIGN_TIMEOUT_MS))
+    {
+        return;                         /* 挂起，等节拍 */
+    }
+
     /* 0) ★ 动任何寄存器之前，先把"当前输出相位"取出来 ★
      *    DMA 循环模式下 CNDTR 从 s_live_n 递减到 0 再回绕，所以
      *        已传输点数 = s_live_n - CNDTR
@@ -604,6 +635,8 @@ void Signal_Init(void)
     s_arr     = 0U;
     s_npts    = 1024U;
     s_live_n  = 0U;                     /* DMA 还没跑过，相位视为 0 */
+    s_last_realign_ms = HAL_GetTick();
+    s_dirty   = 1U;                     /* 首次必须重铺 */
 
     /* ★ 这里**不要**去改 DAC3->MCR。实测结论（2026-10-12）：
      *   CubeMX 生成的 dac.c 里是
@@ -848,8 +881,33 @@ void Signal_Realign(void)
     }
     ch = (DMA_Channel_TypeDef *)hdac3.DMA_Handle1->Instance;
 
-    /* ---- 1) 停表：此刻起输出冻结，到重新起振大约 1~2us ---- */
+    /* ---- 0) ★ 停表之前先记时间，再停下来 ---- */
     __HAL_TIM_DISABLE(&htim6);
+    s_last_realign_ms = HAL_GetTick();
+
+    /* ============ ★★★ 把挂起的改动在这一刻一次性落地 ★★★ ============
+     *
+     *   signal_apply() 在锁相模式下**故意什么都不做**，只把改动挂起（s_dirty=1），
+     *   就是为了等这一刻 —— 因为"输出相位归零"这个动作只有在这里才是正确的：
+     *   现在正是对方的上升沿，输出本来就该从相位 0 重新开始，
+     *   归零看不出任何跳变。放在周期中间做就会看到一次突然的相位错乱
+     *   （用户报的"偶发相位错乱"就是这个）。
+     *
+     *   这里做两件事：
+     *     ① 重铺整张表（按当前的波形/电平/占空比/相位偏移）
+     *     ② 如果点数或频率也变了，一并把 PSC/ARR 更新掉
+     *   重铺一张正弦表要 N 次 sinf()（N=1022 约 1ms），会拉长这次中断，
+     *   但只在参数真的变了时才发生（节流后最多 4 次/秒），可以接受。 */
+    if (s_dirty != 0U)
+    {
+        wave_fill_n(s_npts, s_phase_off);
+        s_live_n    = s_npts;
+        s_tab_phase = s_phase_off;
+        s_dirty     = 0U;
+
+        __HAL_TIM_SET_PRESCALER(&htim6, s_psc);
+        __HAL_TIM_SET_AUTORELOAD(&htim6, s_arr);
+    }
 
     /* ---- 2) 关 DMA 请求 + 通道，清标志（绕开 HAL_DAC_Stop_DMA，见 signal_apply 坑 1）---- */
     DAC3->CR &= ~DAC_CR_DMAEN1;
