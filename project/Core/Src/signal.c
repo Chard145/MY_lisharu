@@ -522,6 +522,38 @@ static void signal_pick_n(float freq_hz, uint32_t n_max,
         n_max = SIN_MAX_POINTS;
     }
 
+    /* ==================== ★ 先试"当前正在用的 N"，能沿用就沿用 ★ ====================
+     *
+     * 为什么必须加这一条（2026-10-12 实测定位）：
+     *   换 N 会重铺整张表，而正弦表每个点都要一次 sinf()，
+     *   N=1022 时这一步约 1ms，期间 TIM6 停着、输出被冻结。
+     *   频率跟踪时 s_out_hz 一直在小幅抖动（低通滤波的残差），
+     *   下面那个"扫出误差最小的 N"就会跟着反复改 N ——
+     *   实测每秒重铺几十次，主循环被拖过 4.1ms，
+     *   于是 DMA 套圈丢样本（g_trk_laps 从 0 涨到 53/s），频率跟着算错。
+     *
+     *   所以：如果当前这个 N 凑出来的频率已经够准（误差 ≤0.1%），就直接沿用，
+     *   不为了一点点精度去付整张表重铺的代价。
+     *   0.1% 对"同频"完全够用，而重铺导致的丢样本才是真正致命的。 */
+    if ((s_live_n >= 4U) && (s_live_n <= n_max))
+    {
+        float    target   = (float)TIM6_CLK_HZ / (freq_hz * (float)s_live_n);
+        uint32_t keep_prd = (uint32_t)(target + 0.5f);
+
+        if ((keep_prd >= 2U) && (keep_prd <= 65536U))
+        {
+            float fa  = (float)TIM6_CLK_HZ / ((float)keep_prd * (float)s_live_n);
+            float err = fabsf(fa - freq_hz) / freq_hz;
+
+            if (err <= 0.001f)              /* 0.1% 以内 → 沿用，不重铺表 */
+            {
+                *out_n   = s_live_n;
+                *out_prd = keep_prd;
+                return;
+            }
+        }
+    }
+
     for (n = n_max; n >= 4U; n--)
     {
         float target = (float)TIM6_CLK_HZ / (freq_hz * (float)n);

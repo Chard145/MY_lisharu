@@ -56,8 +56,8 @@
 #define TRK_MIN_CROSS       3U
 
 /* 滑动窗口最多保留几个上升沿。太多会让高频段反应变慢，
- * 12 个 ≈ 11 个周期，对 50kHz 来说只有 220us，够快。 */
-#define TRK_MAX_CROSS       12U
+ * 20 个 ≈ 19 个周期：50kHz 时只有 380us，1kHz 时 19ms —— 都很轻。 */
+#define TRK_MAX_CROSS       20U
 
 /* 目标跨度（样本数）。达到了就立刻算，不再等更多上升沿。
  * 500kSPS 下 1500 样本 = 3ms：1kHz 时正好 3 个周期，
@@ -180,6 +180,7 @@ volatile uint32_t g_trk_duty_ppm = 0U;   /* 对方方波占空比，单位 ppm *
 volatile uint32_t g_trk_vmin     = 0U;   /* 对方低电平码值（直接搬给 DAC 用） */
 volatile uint32_t g_trk_vmax     = 0U;   /* 对方高电平码值 */
 volatile uint32_t g_trk_laps     = 0U;   /* ★ 因主循环太慢而丢掉整圈样本的次数（应该一直是 0）*/
+volatile uint32_t g_trk_reject   = 0U;   /* ★ 被假沿校验丢弃的过零点个数（假沿会直接拉偏频率）*/
 
 /* ============================== 内部状态 ============================== */
 
@@ -276,6 +277,11 @@ static uint32_t s_app_vmin;
 static uint32_t s_app_vmax;
 static uint8_t  s_app_wave = 0xFFU;
 static float    s_app_duty = -1.0f;
+
+/* 测频结果的中值滤波（3 点），见 trk_median3() */
+static float    s_med[3];
+static uint8_t  s_med_n;
+static uint8_t  s_med_i;
 
 /* 前置声明：这几个函数定义在 trk_env_update / trk_feed / trk_maybe_measure 之后，
  * 但它们要被前面的函数调用，所以必须先声明，否则编译器按隐式声明处理会报错。 */
@@ -407,12 +413,45 @@ static uint8_t trk_slot(uint8_t i)
 }
 
 /**
-  * @brief  记录一个上升沿时刻
+  * @brief  记录一个上升沿时刻（带假沿校验）
   * @param  idx  该沿所在的前一个样本的全局序号（沿位于 idx 和 idx+1 之间）
   * @param  frac 插值得到的小数位置，[0,1)
+  *
+  * ★★ 假沿校验 —— 修"输出乱跳"的关键（2026-10-12 实测定位）★★
+  *
+  *   症状：测频结果里约 25% 是比真值高 13%~22% 的离群值，
+  *         输出频率跟着跳（VOFA+ 上 ch1/ch2 峰峰有 300Hz）。
+  *
+  *   为什么 3 点中值挡不住：假过零点一旦进了滑动窗口，会在里面**滞留
+  *   最多 TRK_MAX_CROSS 次测量**（每次窗口只滑动一个沿），
+  *   所以离群值不是孤立的、而是成串出现，中值滤波无能为力。
+  *
+  *   假沿从哪来：主循环被拖慢时 DMA 套圈丢样本，或者读到 DMA 正在写的
+  *   那个半新半旧的样本 —— 两者都会凭空造出一个过零点。
+  *
+  *   假沿的特征很干净：**它和上一个沿的间隔远小于正常周期**。
+  *   正常过零点之间至少隔一个周期，假沿则紧贴着真沿。
+  *   所以只要拿当前输出频率当参考，间隔 < 半个周期就直接丢弃。
+  *   比"事后滤波"强得多：脏数据根本进不了窗口。
   */
 static void trk_push_cross(uint32_t idx, float frac)
 {
+    /* ---- 假沿校验：和上一个沿太近就丢弃 ---- */
+    if (s_cn > 0U)
+    {
+        uint8_t  prev_i = trk_slot((uint8_t)(s_cn - 1U));
+        uint32_t d      = (uint32_t)((int32_t)idx - (int32_t)s_cidx[prev_i]);
+        float    dt     = (float)d + (frac - s_cfrac[prev_i]);
+        float    fref   = (s_out_hz > 1.0f) ? s_out_hz : 1000.0f;
+        float    expect = TRK_FS_HZ / fref;      /* 预期周期（样本数） */
+
+        if (dt < (expect * 0.5f))
+        {
+            g_trk_reject++;
+            return;                              /* 判为假沿，不记入窗口 */
+        }
+    }
+
     s_cidx[s_cw]  = idx;
     s_cfrac[s_cw] = frac;
 
@@ -422,6 +461,49 @@ static void trk_push_cross(uint32_t idx, float frac)
         s_cn++;
     }
     g_trk_cross_n = (uint32_t)s_cn;
+}
+
+/**
+  * @brief  3 点中值滤波 —— 专治测频结果里的孤立离群值
+  *
+  * ★ 为什么需要它（2026-10-12 实测）★
+  *   实测测频结果里混着约 25% 的高离群值（比真值高 13%~22%）。
+  *   来源：主循环被拖慢时 DMA 套圈丢样本，或者读到 DMA 正在写的那个半新半旧的样本，
+  *   两种都会产生**假过零点** → 窗口内"沿数不变但跨度变短" → 频率偏高。
+  *
+  *   关键性质：**离群值是孤立的**。相邻两次测量共享绝大部分上升沿，
+  *   不可能同时错。所以取 3 点中值就能干净地剔掉，而且不像均值那样被离群值拉偏。
+  *
+  *   代价：真实频率突变时要慢一拍（第一次突变会被中值挡掉，第二次才通过）。
+  *   用户明确说过输入"改变后很久不变、或者变化很慢"，所以这个代价可以忽略。
+  */
+static float trk_median3(float x)
+{
+    float a;
+    float b;
+    float c;
+    float t;
+
+    s_med[s_med_i] = x;
+    s_med_i = (uint8_t)((s_med_i + 1U) % 3U);
+    if (s_med_n < 3U)
+    {
+        s_med_n++;
+    }
+    if (s_med_n < 3U)
+    {
+        return x;                       /* 还没攒够 3 个，先原样返回 */
+    }
+
+    a = s_med[0];
+    b = s_med[1];
+    c = s_med[2];
+
+    if (a > b) { t = a; a = b; b = t; }
+    if (b > c) { t = b; b = c; c = t; }
+    if (a > b) { t = a; a = b; b = t; }
+
+    return b;                           /* 中值 */
 }
 
 /**
@@ -463,6 +545,9 @@ static void trk_maybe_measure(void)
     {
         return;                         /* 离谱，当误检丢掉 */
     }
+
+    /* ★ 先过 3 点中值，剔掉孤立的离群值（详见 trk_median3）★ */
+    f = trk_median3(f);
 
     s_in_hz     = f;
     g_trk_measures++;
@@ -988,6 +1073,13 @@ void Track_Init(void)
     s_app_wave      = 0xFFU;
     s_app_duty      = -1.0f;
 
+    /* 中值滤波 */
+    s_med[0] = 0.0f;
+    s_med[1] = 0.0f;
+    s_med[2] = 0.0f;
+    s_med_n  = 0U;
+    s_med_i  = 0U;
+
     /* 每周期极值 / 稳定电平 / DMA 绕圈检测 */
     s_per_min    = 4095;
     s_per_max    = 0;
@@ -1100,7 +1192,13 @@ void Track_Poll(void)
             g_trk_samples += ADC_BUF_LEN;
             return;
         }
-        avail = backlog;
+        /* ★ 留 TRK_SAFE_MARGIN 个样本不碰 ★
+         *   DMA 可能正在写最后那几个，读到半新半旧的值会产生**假过零点**，
+         *   假过零点会让 span 偏短 → 算出来的频率偏高。
+         *   （踩过：把安全余量去掉、直接 avail=backlog 之后，
+         *     测得频率里混进了约 25% 的 +13%~+22% 离群值。）
+         *   留了余量后 backlog 会稳定停在这个余量上，不会再无限涨。 */
+        avail = (backlog > TRK_SAFE_MARGIN) ? (backlog - TRK_SAFE_MARGIN) : 0U;
     }
 
     for (i = 0U; i < avail; i++)

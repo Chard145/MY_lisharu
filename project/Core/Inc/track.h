@@ -112,6 +112,12 @@ extern volatile uint32_t g_trk_vmin;
 extern volatile uint32_t g_trk_vmax;
 extern volatile uint32_t g_trk_laps;
 
+/* ★ 被"假沿校验"丢弃的过零点个数。
+ *   假过零点（丢样本 / 读到 DMA 正在写的样本造成的）会让窗口内
+ *   "沿数不变但跨度变短" → 频率偏高，而且是成串影响（会在窗口里滞留 20 次测量），
+ *   事后中值滤波挡不住，只能在源头丢弃。这个计数就是丢弃了多少个。 */
+extern volatile uint32_t g_trk_reject;
+
 /* ============================== 诊断计数（J-Link 可直接读）============================== */
 extern volatile uint32_t g_trk_measures;   /* 算出频率结果的次数 */
 extern volatile uint32_t g_trk_updates;    /* 真正调用 Signal_SetFreq() 的次数 */
