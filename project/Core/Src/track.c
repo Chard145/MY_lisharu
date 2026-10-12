@@ -55,9 +55,16 @@
  * 取 3 是为了低频也能在 2 个周期内出结果，兼顾响应速度。 */
 #define TRK_MIN_CROSS       3U
 
-/* 滑动窗口最多保留几个上升沿。太多会让高频段反应变慢，
- * 20 个 ≈ 19 个周期：50kHz 时只有 380us，1kHz 时 19ms —— 都很轻。 */
-#define TRK_MAX_CROSS       20U
+/* 滑动窗口最多保留几个上升沿。
+ * ★ 2026-10-12 从 12 → 20 → 40 ★
+ *   用户明确要求："可以慢，但不能不稳定"。判定依据就是多跨几个波，
+ *   跨的周期越多，单次测量的相对误差越小（误差 ≈ 1/跨的周期数）。
+ *   代价只是响应变慢，而这正是可以接受的。
+ *      50kHz 时 40 个沿 = 0.8ms
+ *      1kHz  时 40 个沿 = 39ms
+ *      150Hz 时 40 个沿 = 260ms
+ *      50Hz  时 40 个沿 = 780ms   ← 最慢的一档，仍可接受 */
+#define TRK_MAX_CROSS       40U
 
 /* 目标跨度（样本数）。达到了就立刻算，不再等更多上升沿。
  * 500kSPS 下 1500 样本 = 3ms：1kHz 时正好 3 个周期，
@@ -81,14 +88,48 @@
 #define TRK_SAFE_MARGIN     8U
 
 /* ---- 输出三级处理 ---- */
-/* 变化超过这个比例视为"换频"，直接跟上去（不做低通，否则跟不上跳变） */
-#define TRK_JUMP_RATIO      0.25f
-/* 一阶低通系数。越小越稳但越慢 */
-#define TRK_LP_ALPHA        0.35f
-/* 相对死区：输出值变化小于 0.1% 就不去动 DAC。
- * ★ 必须要有：Signal_SetFreq() 内部会重铺正弦表并把相位复位，
- *   调用太频繁会在输出上留下周期性毛刺。 */
-#define TRK_DEADBAND        0.001f
+/* 变化超过这个比例视为"对方真的换频了"，直接跟上去，不走低通。
+ * ★ 从 0.25 提到 0.6 ★ 免得一次偶然的偏大测量被当成"换频"而瞬间拖走输出。 */
+#define TRK_JUMP_RATIO      0.6f
+
+/* ★★ 低通用"时间常数"而不是"固定系数"（2026-10-12 改）★★
+ *
+ *   原来写的是 s_out_hz += 0.35f * (f - s_out_hz)，固定系数。
+ *   问题是测量次数跟频率成正比：1kHz 时每秒测 1000 次，50Hz 时每秒 50 次 ——
+ *   同样的系数，低频几乎没滤波、高频滤得很狠，行为完全不一致。
+ *
+ *   改成按时间算系数（一阶低通的标准离散化）：
+ *       alpha = dt / (TAU + dt)
+ *   这样不管测量多快多慢，时间常数都是 TAU 秒，平滑程度一致。
+ *
+ *   TAU 取 0.5s：真实换频大约 1.5s 后跟上 —— 用户说了"可以慢，但不能不稳定"。 */
+#define TRK_LP_TAU_S        0.5f
+
+/* ★★ 斜率限制 —— 治"抖动"最狠的一招（2026-10-12 加）★★
+ *
+ *   用户的原始需求："主要假设对短期不变……可以慢，但不能不稳定"。
+ *   既然对方信号短期内不会变，输出频率就**没有理由快速变化** ——
+ *   任何比这个上限更快的"变化"都是测量噪声，不是真的换频。
+ *
+ *   所以限定 s_out_hz 的**移动量**：
+ *       max_move = s_out_hz × TRK_SLEW_PCT_S × dt
+ *   1kHz 测量率下 dt≈1ms、取 0.1 时每次最多移动 0.1Hz（即 100Hz/s）。
+ *   一次尖峰只持续约 1ms，最多把输出拉走 0.1Hz —— 彻底挡在门外；
+ *   而真实换频由低通算出的移动量远小于这个上限，不受任何影响
+ *   （对方变 10% 约 1 秒跟上）。
+ *
+ *   ⚠️ 千万别把限制加在 f 上 —— 那样斜率上限会再乘一次低通系数，
+ *      收敛速度掉到约 1Hz/s，真实换频要几十秒才跟上（踩过）。
+ *
+ *   真实大换频（>60%）走 TRK_JUMP_RATIO 那条快速通道，也不受影响。 */
+#define TRK_SLEW_PCT_S      0.1f
+/* 相对死区：输出值变化小于 0.2% 就不去动 DAC。
+ * ★ 必须要有：Signal_SetFreq() 内部可能重铺正弦表（1ms，期间输出冻结），
+ *   调用太频繁会在输出上留下周期性毛刺。
+ * ★ 从 0.1% 提到 0.2%：配合上面按时间常数的低通，
+ *   让 DAC 的频率只在 s_out_hz 真的漂出 0.2% 时才变，输出更稳。
+ *   相位由 AWD 每周期硬复位，所以 0.2% 的频率差不会累积、看不出来。 */
+#define TRK_DEADBAND        0.002f
 /* 两次真正 SetFreq 之间的最小间隔(ms)，进一步限制相位复位带来的扰动 */
 #define TRK_MIN_UPDATE_MS   1U
 
@@ -181,6 +222,7 @@ volatile uint32_t g_trk_vmin     = 0U;   /* 对方低电平码值（直接搬给
 volatile uint32_t g_trk_vmax     = 0U;   /* 对方高电平码值 */
 volatile uint32_t g_trk_laps     = 0U;   /* ★ 因主循环太慢而丢掉整圈样本的次数（应该一直是 0）*/
 volatile uint32_t g_trk_reject   = 0U;   /* ★ 被假沿校验丢弃的过零点个数（假沿会直接拉偏频率）*/
+volatile uint32_t g_trk_raw_hz   = 0U;   /* ★ 原始测量值（只过中值，未平滑）—— 抖动诊断用 */
 
 /* ============================== 内部状态 ============================== */
 
@@ -209,6 +251,7 @@ static float    s_out_hz;           /* 低通后的输出频率 */
 static float    s_set_hz;           /* 上次真正设给 DAC 的值 */
 static uint8_t  s_have_out;         /* 输出频率是否已建立 */
 static uint32_t s_last_upd_ms;      /* 上次 SetFreq 的时刻 */
+static uint32_t s_lp_cyc;           /* 上次低通更新的 DWT 周期数（算 dt 用） */
 
 /* ---------- 波形识别 / 电平搬运 / 相位对齐 的内部状态 ---------- */
 static uint32_t s_lo_rail;          /* 当前统计窗里贴**下轨**的样本数 */
@@ -278,8 +321,8 @@ static uint32_t s_app_vmax;
 static uint8_t  s_app_wave = 0xFFU;
 static float    s_app_duty = -1.0f;
 
-/* 测频结果的中值滤波（3 点），见 trk_median3() */
-static float    s_med[3];
+/* 测频结果的中值滤波（5 点），见 trk_median5() */
+static float    s_med[5];
 static uint8_t  s_med_n;
 static uint8_t  s_med_i;
 
@@ -464,46 +507,56 @@ static void trk_push_cross(uint32_t idx, float frac)
 }
 
 /**
-  * @brief  3 点中值滤波 —— 专治测频结果里的孤立离群值
+  * @brief  5 点中值滤波 —— 抑制测频结果里的离群值
   *
   * ★ 为什么需要它（2026-10-12 实测）★
-  *   实测测频结果里混着约 25% 的高离群值（比真值高 13%~22%）。
-  *   来源：主循环被拖慢时 DMA 套圈丢样本，或者读到 DMA 正在写的那个半新半旧的样本，
-  *   两种都会产生**假过零点** → 窗口内"沿数不变但跨度变短" → 频率偏高。
+  *   测频结果里会混进离群值（比真值偏高或偏低十几~几十个百分点）。
+  *   来源：主循环被拖慢时 DMA 套圈丢样本、读到 DMA 正在写的半新半旧样本、
+  *   或者丢失/多出一个过零点 —— 都会让"沿数与跨度"不再匹配。
   *
-  *   关键性质：**离群值是孤立的**。相邻两次测量共享绝大部分上升沿，
-  *   不可能同时错。所以取 3 点中值就能干净地剔掉，而且不像均值那样被离群值拉偏。
+  *   真正的第一道防线是 trk_push_cross() 里的假沿校验（在源头丢弃），
+  *   这里的中值只是第二道防线：即使漏进来一两个，也不会被均值那样拉偏。
   *
-  *   代价：真实频率突变时要慢一拍（第一次突变会被中值挡掉，第二次才通过）。
-  *   用户明确说过输入"改变后很久不变、或者变化很慢"，所以这个代价可以忽略。
+  *   ★ 从 3 点扩到 5 点：假沿有时会连续漏进两个，3 点中值挡不住，5 点可以。
+  *     代价是真实换频慢一拍 —— 用户说了"可以慢，但不能不稳定"，正合适。
   */
-static float trk_median3(float x)
+static float trk_median5(float x)
 {
-    float a;
-    float b;
-    float c;
-    float t;
+    float   t[5];
+    uint8_t i;
+    uint8_t j;
 
     s_med[s_med_i] = x;
-    s_med_i = (uint8_t)((s_med_i + 1U) % 3U);
-    if (s_med_n < 3U)
+    s_med_i = (uint8_t)((s_med_i + 1U) % 5U);
+    if (s_med_n < 5U)
     {
         s_med_n++;
     }
-    if (s_med_n < 3U)
+    if (s_med_n < 5U)
     {
-        return x;                       /* 还没攒够 3 个，先原样返回 */
+        return x;                       /* 还没攒够 5 个，先原样返回 */
     }
 
-    a = s_med[0];
-    b = s_med[1];
-    c = s_med[2];
+    for (i = 0U; i < 5U; i++)
+    {
+        t[i] = s_med[i];
+    }
 
-    if (a > b) { t = a; a = b; b = t; }
-    if (b > c) { t = b; b = c; c = t; }
-    if (a > b) { t = a; a = b; b = t; }
+    /* 5 个元素的插入排序，够用 */
+    for (i = 1U; i < 5U; i++)
+    {
+        float key = t[i];
 
-    return b;                           /* 中值 */
+        j = i;
+        while ((j > 0U) && (t[j - 1U] > key))
+        {
+            t[j] = t[j - 1U];
+            j--;
+        }
+        t[j] = key;
+    }
+
+    return t[2];                        /* 中值 */
 }
 
 /**
@@ -546,9 +599,10 @@ static void trk_maybe_measure(void)
         return;                         /* 离谱，当误检丢掉 */
     }
 
-    /* ★ 先过 3 点中值，剔掉孤立的离群值（详见 trk_median3）★ */
-    f = trk_median3(f);
+    /* ★ 先过 5 点中值，剔掉离群值（第一道防线是 trk_push_cross 的假沿校验）★ */
+    f = trk_median5(f);
 
+    g_trk_raw_hz = (uint32_t)(f + 0.5f);    /* 原始测量值，仅供诊断 */
     s_in_hz     = f;
     g_trk_measures++;
     g_trk_in_hz = (uint32_t)(f + 0.5f);
@@ -564,19 +618,61 @@ static void trk_maybe_measure(void)
      * 放在频率处理之前：波形和电平是"慢变量"，先更新它们，后面的换频才能基于新表算。 */
     trk_apply_waveform();
 
-    /* ---- 第二级：换频检测 / 一阶低通 ---- */
-    if (s_have_out == 0U)
+    /* ---- 第二级：换频检测 / 按时间常数的一阶低通 ----
+     * ★ 用 DWT 周期数算 dt，得到"以秒为单位"的固定时间常数 ★
+     *   固定系数的写法在不同频段行为完全不同（测量次数跟频率成正比），
+     *   必须按时间算 alpha = dt/(TAU+dt) 才能到处都一样平滑。 */
     {
-        s_out_hz   = f;
-        s_have_out = 1U;
-    }
-    else if (fabsf(f - s_out_hz) > (TRK_JUMP_RATIO * s_out_hz))
-    {
-        s_out_hz = f;                   /* 对方换频了，直接跟上，别被低通拖住 */
-    }
-    else
-    {
-        s_out_hz += TRK_LP_ALPHA * (f - s_out_hz);
+        uint32_t now_cyc = DWT->CYCCNT;
+        float    dt      = (float)(uint32_t)(now_cyc - s_lp_cyc) / 170000000.0f;
+        float    alpha;
+
+        s_lp_cyc = now_cyc;
+        if (dt > 2.0f)
+        {
+            dt = 2.0f;                  /* 首次 / 长时间没更新：直接把 alpha 拉到 1 */
+        }
+        alpha = dt / (TRK_LP_TAU_S + dt);
+        if (alpha > 1.0f)
+        {
+            alpha = 1.0f;
+        }
+
+        if (s_have_out == 0U)
+        {
+            s_out_hz   = f;
+            s_have_out = 1U;
+        }
+        else if (fabsf(f - s_out_hz) > (TRK_JUMP_RATIO * s_out_hz))
+        {
+            s_out_hz = f;               /* 对方真的换频了（差距很大），直接跟上 */
+        }
+        else
+        {
+            /* 1) 先做"按时间常数"的一阶低通 */
+            float target = s_out_hz + alpha * (f - s_out_hz);
+
+            /* 2) ★ 再对"这一步的移动量"做斜率限制 ★
+             *
+             *   ⚠️ 必须限制 s_out_hz 的移动量，**不能限制 f**（踩过一次）：
+             *      限制 f 的话，斜率上限会再乘一次 alpha ——
+             *      每步移动 = alpha × max_d ≈ 0.002 × 0.5 = 0.001Hz，
+             *      收敛速度被压到约 1Hz/s，真实换频要几十秒才跟上，
+             *      现象是 s_out_hz 呈**线性**慢爬而不是指数收敛。
+             *
+             *   限制移动量之后：
+             *     真实换频：低通算出的移动量远小于上限 → 完全不受限，正常收敛
+             *     测量尖峰：单次只影响一个测量周期（约1ms），最多把输出拉走
+             *               s_out_hz×0.1×0.001 ≈ 0.1Hz → 彻底挡在门外 */
+            {
+                float max_move = s_out_hz * TRK_SLEW_PCT_S * dt + 0.02f;
+                float move     = target - s_out_hz;
+
+                if (move >  max_move) { move =  max_move; }
+                if (move < -max_move) { move = -max_move; }
+                s_out_hz += move;
+            }
+        }
     }
 
     if (s_out_hz < SIGNAL_FREQ_MIN) { s_out_hz = SIGNAL_FREQ_MIN; }
@@ -1077,6 +1173,8 @@ void Track_Init(void)
     s_med[0] = 0.0f;
     s_med[1] = 0.0f;
     s_med[2] = 0.0f;
+    s_med[3] = 0.0f;
+    s_med[4] = 0.0f;
     s_med_n  = 0U;
     s_med_i  = 0U;
 
@@ -1099,6 +1197,7 @@ void Track_Init(void)
     DWT->CYCCNT = 0U;
     DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
     s_cyc_base  = DWT->CYCCNT;
+    s_lp_cyc    = s_cyc_base;           /* 低通 dt 的起点 */
 
     /* s_rd 是"下一个要处理的缓冲下标"，s_total 是对应的全局样本号。
      * 两者必须同步推进：s_rd == (初始fill + s_total) % ADC_BUF_LEN。 */
@@ -1218,7 +1317,12 @@ void Track_Poll(void)
 
 float Track_GetInFreq(void)
 {
-    return s_in_hz;
+    /* ★ 返回"平滑后、真正驱动输出的那个值"，不是原始测量值 ★
+     *   原始测量里混着离群值（丢样本/假过零点造成的），
+     *   直接显示出来会看着一直在抖，但那个抖动并没有传到输出上
+     *   —— 它已经被斜率限制 + 时间常数低通挡掉了。
+     *   想让 VOFA+ 上看原始测量做诊断，读 g_trk_raw_hz。 */
+    return (s_have_out != 0U) ? s_out_hz : s_in_hz;
 }
 
 float Track_GetOutFreq(void)

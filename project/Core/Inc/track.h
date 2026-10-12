@@ -118,6 +118,12 @@ extern volatile uint32_t g_trk_laps;
  *   事后中值滤波挡不住，只能在源头丢弃。这个计数就是丢弃了多少个。 */
 extern volatile uint32_t g_trk_reject;
 
+/* ★ 原始测量值（只过 5 点中值，未做时间常数低通、未做斜率限制）。
+ *   Track_GetInFreq() 返回的是**平滑后**的值，两者会明显不同：
+ *   原始值里有离群尖峰，但那些尖峰已经被挡在输出之外。
+ *   想看"测频本身干不干净"就读这个；想看"实际用了多少"就读 Track_GetInFreq()。 */
+extern volatile uint32_t g_trk_raw_hz;
+
 /* ============================== 诊断计数（J-Link 可直接读）============================== */
 extern volatile uint32_t g_trk_measures;   /* 算出频率结果的次数 */
 extern volatile uint32_t g_trk_updates;    /* 真正调用 Signal_SetFreq() 的次数 */
