@@ -1,0 +1,34 @@
+# ============================================================================
+#   .gitattributes
+# ============================================================================
+#  为什么需要它：
+#    Windows 上的 git 默认 core.autocrlf=true，会把仓库里的 LF 在检出时
+#    改成 CRLF、提交时又改回 LF。对嵌入式工程来说这有两个麻烦：
+#      ① 每动一次文件，git 都会重写整个文件 → diff 全是噪音
+#      ② 万一工具链对换行敏感（.sh / Makefile），可能出诡异问题
+#    这里显式声明"文本文件按原样存"，换行符不再被 git 偷偷改。
+#    source 文件统一用 LF（gcc 两种都吃，但统一了以后 diff 干净）。
+# ============================================================================
+
+# 默认：自动识别文本文件，统一按 LF 存放，检出时不转换
+* text=auto eol=lf
+
+# ---- 明确是文本的 ----
+*.c      text eol=lf
+*.h      text eol=lf
+*.s      text eol=lf
+*.S      text eol=lf
+*.ld     text eol=lf
+*.ioc    text eol=lf
+*.txt    text eol=lf
+*.md     text eol=lf
+*.json   text eol=lf
+*.jlink  text eol=lf
+*.py     text eol=lf
+
+# ---- 明确是二进制的（别做任何转换）----
+*.png    binary
+*.jpg    binary
+*.ico    binary
+*.pdf    binary
+*.zip    binary

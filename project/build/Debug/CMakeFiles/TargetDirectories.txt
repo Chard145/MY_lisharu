@@ -1,6 +1,0 @@
-C:/Users/chard/Desktop/MY_lisharu/project/build/Debug/CMakeFiles/project.dir
-C:/Users/chard/Desktop/MY_lisharu/project/build/Debug/CMakeFiles/edit_cache.dir
-C:/Users/chard/Desktop/MY_lisharu/project/build/Debug/CMakeFiles/rebuild_cache.dir
-C:/Users/chard/Desktop/MY_lisharu/project/build/Debug/cmake/stm32cubemx/CMakeFiles/STM32_Drivers.dir
-C:/Users/chard/Desktop/MY_lisharu/project/build/Debug/cmake/stm32cubemx/CMakeFiles/edit_cache.dir
-C:/Users/chard/Desktop/MY_lisharu/project/build/Debug/cmake/stm32cubemx/CMakeFiles/rebuild_cache.dir

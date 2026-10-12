@@ -1,0 +1,64 @@
+# ============================================================================
+#   .gitignore  --  STM32G431 信号发生器工程
+# ============================================================================
+#  为什么这么写：
+#    这个工程是 CMake + Ninja + arm-gcc 构建的，build/ 目录一次编译就有
+#    ~47MB 的中间产物（object/elf/map/依赖文件），全部是**可再生的**，
+#    提交进去只会让仓库爆掉、每次 diff 都是噪音。
+#    排除之后仓库只有 ~7.8MB（其中 Drivers/ 的 HAL 库占大头）。
+# ============================================================================
+
+# ---- 构建产物（由 cmake --build 生成，可随时重建）----
+build/
+Debug/
+Release/
+*.o
+*.obj
+*.elf
+*.map
+*.hex
+*.bin
+*.lst
+*.crf
+*.d
+*.axf
+*.htm
+*.lnp
+*.dep
+*.sct
+*.build_log.htm
+
+# ---- 编辑器 / IDE 个人配置 ----
+.vscode/
+.idea/
+.settings/
+*.uvguix.*
+*.uvoptx
+*.uvprojx
+
+# ---- 编译数据库（由 cmake 生成，路径是本机的绝对路径，对别人没用）----
+compile_commands.json
+compile_commands.json.bak
+
+# ---- 系统垃圾 ----
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- Python 缓存（Port/ 里有几个辅助脚本）----
+__pycache__/
+*.pyc
+
+# ============================================================================
+#  下面这些**故意不排除**，它们必须进仓库：
+#    project.ioc            CubeMX 工程配置（唯一事实源）
+#    .mxproject             CubeMX 生成状态记录
+#    CMakeLists.txt         用户源码清单（改这里加文件）
+#    CMakePresets.json      构建预设
+#    cmake/stm32cubemx/     CubeMX 生成的构建脚本
+#    Core/  Drivers/        CubeMX 生成的代码 + HAL 库
+#    Port/                  用户外设驱动（RTT 中间件 + 桥脚本）
+#    *.jlink                烧录/读寄存器的 J-Link 脚本
+#    STM32G431XX_FLASH.ld   链接脚本
+#    startup_stm32g431xx.s  启动文件
+# ============================================================================

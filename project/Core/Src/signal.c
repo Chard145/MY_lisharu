@@ -48,6 +48,40 @@
 /* TIM6 输入时钟 = APB1 定时器时钟 = 170MHz（改主频必须同步改这里！）*/
 #define TIM6_CLK_HZ             170000000UL
 
+/* ==================== 波形生成方式（对比实验开关）====================
+ * SIGNAL_ADAPTIVE_N = 1 : 自适应点数（本工程原方案）
+ *     低频用 1024 点，高频逐段减少（50kHz 时 32 点）
+ *     → 波形最平滑的频段很宽，但高频点数少、阶梯明显
+ *     → 好处：DAC 更新率始终 ≤ ~2MHz，50kHz 也扛得住
+ *
+ * SIGNAL_ADAPTIVE_N = 0 : 固定点数（参考工程 test4_prj 的方案）
+ *     **全频段都用 SIGNAL_FIXED_N 个点**，频率只靠 TIM6 的 PSC/ARR 调。
+ *     参考工程就是 dots=100 定死，然后改 htim7 的 Prescaler/Period。
+ *     → 好处：每个周期点数恒定，低频到中频波形质量完全一致
+ *     → 代价：DAC 更新率 = f_out × N
+ *              50kHz × 100 = 5MHz  ← 远超 DAC 能力，高频会崩
+ *            而且 (ARR+1) = 170e6/(f×N) 变小 → 频率分辨率变差
+ *              50kHz 时 (ARR+1)=34  →  频率误差 2.9%
+ *
+ * 做失真度对比时把下面这个开关切一下重新编译即可。
+ *
+ * SIGNAL_ADAPTIVE_N = 2 : 【推荐】自动选最优 N
+ *     两个约束一起考虑：
+ *       ① N 取"该频率下 DAC 更新率不超过上限"的最大值 → 波形尽量平滑
+ *          低频自动回到 1024 点，高频自动降到 ~100 点
+ *       ② 在 N_max 以内扫描，挑"实际能输出、且最接近目标频率"的组合
+ *          → 同时把频率误差压到最小
+ *     这一档比前两档都好：低频比参考工程平滑，高频和参考工程一样干净，
+ *     而且频率精度反而更高（因为 N 也可以参与凑数）。 */
+#define SIGNAL_ADAPTIVE_N       2
+#define SIGNAL_FIXED_N          100U    /* 参考工程的 dots=100 */
+
+/* DAC 更新率上限（Hz）—— 实测出来的硬指标
+ *   50kHz × 100 点 = 5MHz 时幅度仍然满幅、阶梯消失，说明 5MHz 没问题。
+ *   ⚠️ 这个值直接决定高频能有多少点/周期（N_max = 本值 / f），
+ *      调大了高频更平滑但可能超出 DAC 能力（表现为幅度塌陷、波形畸变）。 */
+#define SIGNAL_DAC_MAX_RATE     5000000UL
+
 /* ====================== 1024 点正弦表（12 位，0~4095）=====================
  * ★ 必须是 RAM 里的可写数组，且在 Signal_Init() 里运行时生成 ★
  *   实测踩坑：把正弦表写成 Flash 里的 `static const` 数组时，波形会被截断
@@ -283,6 +317,83 @@ static void signal_apply(void)
     __HAL_TIM_ENABLE(&htim6);
 }
 
+/**
+  * @brief  为给定频率挑一组 (N, ARR+1)：波形尽量平滑 + 频率尽量准
+  *
+  * 【为什么要扫】
+  *   输出频率 f = f_TIM / ((PSC+1)*(ARR+1)*N)，三个量都必须是整数，
+  *   而目标频率是连续的浮点数 —— 大多数频率**凑不出精确值**。
+  *   只固定 N、只四舍五入 ARR 的话，误差最大能到 f/(ARR+1)：
+  *       50kHz 固定 100 点时 (ARR+1)=34  →  最坏误差 1.5%
+  *       实测 30kHz 就偏成了 29825（0.58%）
+  *
+  *   但 N 是可以自由选的（每次换频都会重铺表），所以把 N 也拿来凑：
+  *   在 [4, N_max] 里扫一遍，对每个 N 算出最近的可达频率，
+  *   取误差最小的那一组。乘积 (ARR+1)*N 越接近 f_TIM/f 就越准。
+  *
+  * 【为什么从大到小扫】
+  *   N 越大波形越平滑，所以优先保留大 N：
+  *   一旦误差已经 ≤0.05% 就立刻停手，不再为了那点精度牺牲波形。
+  *
+  * @param  freq_hz  目标频率（已四舍五入到 0.1Hz）
+  * @param  n_max    N 的上限（= min(SIN_MAX_POINTS, DAC_MAX_RATE/f)）
+  * @param  out_n    输出：选中的点数
+  * @param  out_prd  输出：选中的 (ARR+1)
+  */
+static void signal_pick_n(float freq_hz, uint32_t n_max,
+                          uint32_t *out_n, uint32_t *out_prd)
+{
+    uint32_t n;
+    uint32_t prd;
+    uint32_t best_n   = 4U;
+    uint32_t best_prd = 1U;
+    float    best_err = 1.0e9f;
+
+    if (n_max < 4U)
+    {
+        n_max = 4U;
+    }
+    if (n_max > SIN_MAX_POINTS)
+    {
+        n_max = SIN_MAX_POINTS;
+    }
+
+    for (n = n_max; n >= 4U; n--)
+    {
+        float target = (float)TIM6_CLK_HZ / (freq_hz * (float)n);
+        float fa;
+        float err;
+
+        prd = (uint32_t)(target + 0.5f);
+        if (prd < 2U)
+        {
+            continue;                   /* 触发太快，定时器做不到 */
+        }
+        if (prd > 65536U)
+        {
+            continue;                   /* 16 位定时器装不下 */
+        }
+
+        fa  = (float)TIM6_CLK_HZ / ((float)prd * (float)n);
+        err = (fa > freq_hz) ? (fa - freq_hz) : (freq_hz - fa);
+        err = err / freq_hz;
+
+        if (err < best_err)
+        {
+            best_err = err;
+            best_n   = n;
+            best_prd = prd;
+        }
+        if (err <= 0.0005f)             /* ≤0.05% 就够了，保住这个大 N */
+        {
+            break;
+        }
+    }
+
+    *out_n   = best_n;
+    *out_prd = best_prd;
+}
+
 /* ============================= 对外接口 ============================= */
 
 void Signal_Init(void)
@@ -341,6 +452,42 @@ void Signal_SetFreq(float freq_hz)
     k    = band_index(freq_hz);
     psc  = band_psc[k - 1U];
     npts = band_n[k - 1U];
+
+#if (SIGNAL_ADAPTIVE_N == 0)
+    /* ---- 参考工程方案：全频段固定点数，只用 TIM6 改频率 ----
+     * 参考工程 test4_prj 就是 dots=100 定死，然后改 htim7 的 PSC/Period。
+     * PSC 固定 0（不预分频，让 ARR 尽量大，频率分辨率好一点）。 */
+    psc  = 0U;
+    npts = SIGNAL_FIXED_N;
+    prd  = (uint32_t)(((float)TIM6_CLK_HZ / (freq_hz * (float)npts))
+                      / (float)(psc + 1U) + 0.5f);
+    if (prd < 1U)    { prd = 1U; }
+    if (prd > 65536U){ prd = 65536U; }
+#elif (SIGNAL_ADAPTIVE_N == 2)
+    /* ---- 推荐方案：N 取 DAC 更新率允许的最大值，再扫描凑准频率 ---- */
+    psc = 0U;
+    {
+        uint32_t n_max;
+        uint32_t raw = (uint32_t)((float)SIGNAL_DAC_MAX_RATE / freq_hz);
+
+        n_max = (raw < 4U) ? 4U : raw;          /* 至少 4 点/周期 */
+        signal_pick_n(freq_hz, n_max, &npts, &prd);
+        (void)k;
+    }
+#else
+    /* ---- 原方案：按频段表取点数 ---- */
+    prd = (uint32_t)(((float)TIM6_CLK_HZ / (freq_hz * (float)npts))
+                     / (float)(psc + 1U)
+                     + 0.5f);
+    if (prd < 1U)
+    {
+        prd = 1U;
+    }
+    if (prd > 65536U)                   /* 16 位定时器的物理上限 */
+    {
+        prd = 65536U;
+    }
+#endif
 
     /* (ARR+1) = f_TIM / (f * N * (PSC+1))，四舍五入。
      * 必须四舍五入而不是截断：20kHz 时差 1 个 tick 就是 75Hz 的偏差。 */
