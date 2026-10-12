@@ -111,7 +111,41 @@ static uint32_t s_last_realign_ms = 0U; /* 上次 Signal_Realign() 的时刻，�
  * 免得参数永远悬着不生效。见 signal_apply() 里锁相模式那段。 */
 #define SIGNAL_REALIGN_TIMEOUT_MS   200U
 
-static uint32_t sine_tab[SIN_MAX_POINTS];
+/* ==================== ★★ 双缓冲（用户提的"备案"）★★ ====================
+ *
+ * ★ 为什么必须双缓冲（2026-10-12 用户报"偶发跳相、但有一段时期持续稳定"）
+ *
+ *   单缓冲的致命问题：重铺一张正弦表要 N 次 sinf()，
+ *   N=1022 时约 1ms，而 1kHz 信号的一个周期正好也是 1ms ——
+ *   也就是说**重铺期间输出被冻结了整整一个周期**，肉眼就是一次明显的跳变。
+ *   而重铺只在"波形/电平/占空比"变化时才发生，
+ *   所以现象是间歇性的：参数稳的时候一段时期完全稳定，
+ *   参数一抖就连续跳几次 —— 和用户描述完全一致。
+ *
+ *   双缓冲的做法：
+ *     主循环把新表铺到**备用表**上（此时 DMA 还在播正在用的那张，输出完全不受影响）
+ *     铺完打一个"可切换"标记
+ *     Signal_Realign() 里发现标记就**只换一下指针**（几纳秒），
+ *     然后照常重启 DMA —— 这样就再也没有"冻结一个周期"的事了。
+ *
+ *   ★ 这正是用户最早提的思路："确认输出波我们采用慢的方式，但更节拍要快的方式，
+ *     就是直接使用备案即可"。
+ *
+ *   代价：多一张表的 RAM（SIN_MAX_POINTS × 4 字节 = 4KB）。
+ */
+static uint32_t  s_tab_mem[2][SIN_MAX_POINTS];  /* 两张表轮流用 */
+static uint32_t *sine_tab   = s_tab_mem[0];     /* 正在被 DMA 播的那张 */
+static uint32_t *s_fill_tab = s_tab_mem[1];     /* 主循环往里铺新表的那张 */
+static uint8_t   s_tab_idx  = 0U;               /* sine_tab 当前是第几张 */
+static uint8_t   s_swap_ready = 0U;             /* 1 = 备用表已铺好，等 Realign 切换 */
+static uint32_t  s_scratch_n = 0U;              /* 备用表铺的时候用的点数 */
+static float     s_scratch_phase = 0.0f;        /* 备用表铺的时候用的起始相位 */
+
+/* ★ 这两个也定义在这里（原来在文件后面的"内部状态"区），
+ *   因为 wave_swap() 要用它们，而 wave_swap 定义在表声明之后、状态区之前。
+ *   实测踩过一次：声明在后面 → 编译报 'undeclared'。 */
+static uint32_t  s_live_n    = 0U;              /* 正在 DMA 上跑的表长（= sine_tab 的长度） */
+static float     s_tab_phase = 0.0f;            /* 正在播的那张表里烘焙的相位偏移(0~1) */
 
 /**
   * @brief  按"每周期 n 个点"生成正弦表到 RAM
@@ -233,8 +267,44 @@ static void wave_fill_n(uint32_t n, float phase0)
         {
             v = 4095.0f;
         }
-        sine_tab[i] = (uint32_t)(v + 0.5f);
+        s_fill_tab[i] = (uint32_t)(v + 0.5f);
     }
+}
+
+/**
+  * @brief  把新表铺到**备用表**上，并打"可切换"标记
+  * @note   ★ 绝不碰正在被 DMA 播的那张表 ★ 这是双缓冲的全部意义。
+  *         铺表可能要 1ms（正弦 N 次 sinf()），但输出完全不受影响。
+  */
+static void wave_fill_scratch(uint32_t n, float phase0)
+{
+    wave_fill_n(n, phase0);
+    s_scratch_n     = (n < 2U) ? 2U : ((n > SIN_MAX_POINTS) ? SIN_MAX_POINTS : n);
+    s_scratch_phase = phase0;
+    s_swap_ready    = 1U;
+}
+
+/**
+  * @brief  把备用表切成正在播的表（只换指针，瞬间完成）
+  * @note   必须和"重启 DMA"在同一个临界区里做，否则 DMA 可能拿到半切换的地址。
+  */
+static void wave_swap(void)
+{
+    uint32_t *t;
+
+    if (s_swap_ready == 0U)
+    {
+        return;
+    }
+
+    t          = sine_tab;
+    sine_tab   = s_fill_tab;
+    s_fill_tab = t;
+    s_tab_idx  = (uint8_t)(s_tab_idx ^ 1U);
+
+    s_live_n    = s_scratch_n;
+    s_tab_phase = s_scratch_phase;
+    s_swap_ready = 0U;
 }
 
 /* ============================== 频段表 ==============================
@@ -299,10 +369,7 @@ static uint8_t  s_running = 0U;         /* 是否已启动 */
 static uint32_t s_psc     = 0U;         /* 当前预分频值 */
 static uint32_t s_arr     = 0U;         /* 当前重装载值 */
 static uint32_t s_npts    = 1024U;      /* 当前使用的表点数 */
-static uint32_t s_live_n  = 0U;         /* ★ 正在 DMA 上跑的表长，用来反推当前相位 */
-static float    s_tab_phase = 0.0f;     /* ★ 当前正弦表里已经烘焙进去的相位偏移(0~1)
-                                         *   输出相位 = dma下标/N + s_tab_phase
-                                         *   重铺表时忘了加它就会跳一下，见 signal_apply 步骤 0 */
+/* 注：s_live_n / s_tab_phase 已提到文件前面（双缓冲那块），wave_swap() 要用 */
 
 /**
   * @brief  求 k = max{ k | 10*2^(k-1) <= freq_hz }，纯整数运算，避免引入 math.h
@@ -358,64 +425,60 @@ static void signal_apply(void)
         ch = (DMA_Channel_TypeDef *)hdac3.DMA_Handle1->Instance;
     }
 
-    /* ==================== ★★ 快路径：点数没变，就只动定时器 ★★ ====================
+    /* ==================== ★★ 快路径：点数没变，就只写 PSC/ARR ★★ ====================
      *
-     * 为什么必须要有这条快路径（2026-10-12 实测定位）：
-     *
-     *   走下面的慢路径时，每次换频都要 sine_fill_n() 重铺整张表，
-     *   而表里每个点都要调一次 sinf()。N=1022 时这一步要跑约 0.5ms，
-     *   期间 TIM6 是停的、DMA 是停的 → **DAC 输出被冻在最后一个值上**。
-     *
-     *   扫频时无所谓（1.5 秒才换一次档）。但频率跟踪每秒会调几十次
-     *   Signal_SetFreq()，等于每秒有几十毫秒输出是"死"的。
-     *   自监控时测量窗口只有 1.02ms（512 点 @500kSPS），经常整窗落在冻结点上，
-     *   于是峰峰值骤降到几百个码值 → 判定"没信号" → 触发重置 → 又强制换频 → 又冻结，
-     *   形成第二个正反馈。实测现象就是 pk 在 220 和 4095 之间乱跳、resets 每秒涨 125。
+     * 为什么必须要有这条快路径：
+     *   走慢路径每次换频都要重铺整张表（正弦 N 次 sinf()，N=1022 约 1ms），
+     *   期间 TIM6 停着、输出被冻住；而频率跟踪每秒会调很多次 Signal_SetFreq()，
+     *   等于输出的很大一部分时间是"死"的。
      *
      *   关键观察：**只要点数 N 没变，表的内容就一个字都不用改** ——
      *       f = f_TIM / ((PSC+1) * (ARR+1) * N)
-     *   频率只跟 PSC/ARR 有关。DMA 一直在循环搬同一张表，相位天然就是连续的，
-     *   DMA 通道、CMAR、CNDTR **统统不用碰**。
-     *   所以这条路径只重设 TIM6 的 PSC/ARR，耗时几微秒，输出几乎没有空档。
+     *   频率只跟 PSC/ARR 有关，DMA 通道、CMAR、CNDTR 统统不用碰。
      *
-     *   代价：停表/重启会截断当前这个 TIM6 周期，相当于输出相位偏了不到
-     *   1/N 个周期（N=1022 时是 0.1%），肉眼看不出；
-     *   换来的是"换频不再冻结输出"，这个交换非常值。 */
-    if ((ch != NULL) && (s_live_n > 0U) && (s_npts == s_live_n) && (s_dirty == 0U))
+     * ★ 2026-10-12 又改了一次：这条路径**不再停表、不再发 EGR** ★
+     *   原来写的是"停表 → CNT=0 → EGR=UG → 开表"，有两个副作用，每次换频都会造成一次相位跳变：
+     *     ① EGR=UG 会产生一次 TRGO 脉冲 → 多触发一次 DAC/DMA → 表位置凭空前进一格
+     *     ② CNT 被清零 → 当前这个采样间隔被截断
+     *   而 PSC 和 ARR 本来就是**带预装载**的，会在下一个更新事件自动生效 ——
+     *   所以直接写进去就是无缝换频，零跳变，也不需要停表。 */
+    if ((ch != NULL) && (s_live_n > 0U) && (s_npts == s_live_n)
+        && (s_dirty == 0U) && (s_swap_ready == 0U))
     {
-        __HAL_TIM_DISABLE(&htim6);
         __HAL_TIM_SET_PRESCALER(&htim6, s_psc);
         __HAL_TIM_SET_AUTORELOAD(&htim6, s_arr);
-        __HAL_TIM_SET_COUNTER(&htim6, 0U);
-        htim6.Instance->EGR = TIM_EGR_UG;
-        __HAL_TIM_ENABLE(&htim6);
         return;
     }
 
-    /* ==================== ★★★ 锁相模式：把改动推迟到下一次 Signal_Realign() ★★★ ====================
+    /* ==================== ★★★ 锁相模式：铺到备用表，切换留给 Realign ★★★ ====================
      *
-     * ★ 为什么必须这么做（2026-10-12 用户报的"偶发相位错乱"）★
+     * ★ 为什么必须这么做（2026-10-12 用户报"偶发跳相，但有一段时期持续稳定"）★
      *
-     *   下面的慢路径会做三件事：重铺整张表 → 把 DMA 挪回表头 → 把输出拉到 sine_tab[0]。
-     *   最后一步等于**强行把输出相位归零**。而表头是"相位 0"（方波是跳变到高、
-     *   正弦是上升过零点）—— 所以**只要这件事发生在周期中间，输出就突然跳一次相**。
+     *   慢路径会做三件事：重铺整张表 → 把 DMA 挪回表头 → 把输出拉到 sine_tab[0]。
+     *   最后一步等于**强行把输出相位归零**；而重铺本身要 1ms，
+     *   1kHz 信号的一个周期正好也是 1ms —— **输出被冻结整整一个周期**。
+     *   只要这件事发生在周期中间，就是一次肉眼可见的跳变。
+     *   它只在波形/电平/占空比变化时发生，所以现象是间歇的：
+     *   参数稳的时候一段时期完全稳定，一抖就连续跳几次 —— 和用户描述完全一致。
      *
-     *   什么时候会触发？波形/电平/占空比变化时（节流后最多 4 次/秒），
-     *   以及换 N（点数）时。对用户来说就是"很少，但明显"的相位错乱。
+     *   ★ 双缓冲的解法：**铺表在主循环里做，写的是备用表，DMA 还在播正在用的那张，
+     *     输出完全不受影响**；铺完只打一个标记，等 Signal_Realign() 里
+     *     把指针一换（几纳秒）就完事。再也不会冻结输出一个周期。
      *
-     *   ★ 关键洞察：相位归零这个动作**本身没错，错的是时机**。
-     *     它应该只发生在 Signal_Realign() 里 —— 那一刻正是对方的上升沿，
-     *     输出本来就该从相位 0 重新开始，归零完全正确、看不出任何跳变。
-     *
-     *   所以锁相模式下这里什么都不做，只把改动挂起（s_dirty 已经是 1），
-     *   等下一次 Signal_Realign() 一次性落地。这就是"表可以慢、但归零只在对的节拍上"。
-     *
-     *   ⚠️ 唯一的风险：如果对方信号断了、再也没有 Realign，改动就永远悬着。
-     *      所以加一个超时兜底：太久没 Realign（默认 200ms）就走正常流程立刻落地。 */
-    if ((s_phaselock != 0U) && (s_running != 0U)
-        && ((uint32_t)(HAL_GetTick() - s_last_realign_ms) < SIGNAL_REALIGN_TIMEOUT_MS))
+     *   ⚠️ 兜底：如果对方信号断了、再也没有 Realign 来切换，
+     *      改动就永远生效不了。所以超过 SIGNAL_REALIGN_TIMEOUT_MS 就走正常流程立刻落地。 */
+    if ((s_phaselock != 0U) && (s_running != 0U))
     {
-        return;                         /* 挂起，等节拍 */
+        if ((uint32_t)(HAL_GetTick() - s_last_realign_ms) < SIGNAL_REALIGN_TIMEOUT_MS)
+        {
+            if (s_dirty != 0U)
+            {
+                /* ★ 在主循环里铺备用表：耗时 1ms，但输出照常跑，不受任何影响 ★ */
+                wave_fill_scratch(s_npts, s_phase_off);
+                s_dirty = 0U;
+            }
+            return;                     /* 切换留给 Signal_Realign() */
+        }
     }
 
     /* 0) ★ 动任何寄存器之前，先把"当前输出相位"取出来 ★
@@ -467,9 +530,16 @@ static void signal_apply(void)
      *   不能只在 N 变化时铺 —— 因为相位每刻都在变。
      *   代价是每次换频多 N 次 sinf()（N 最大 1024，约几十微秒），
      *   换来的是换频时输出**没有任何台阶**，这个交换在跟频场景下非常值。 */
-    wave_fill_n(s_npts, phase0);
-    s_live_n = s_npts;
-    s_dirty  = 0U;
+    /* 2.5) ★ 按刚才取到的相位重铺正弦表 ★
+     *   必须在这里（DMA 已停、表还没被引用）重铺，而且**每次换频都要铺**，
+     *   不能只在 N 变化时铺 —— 因为相位每刻都在变。
+     *   代价是每次换频多 N 次 sinf()（N 最大 1024，约 1ms），
+     *   换来的是换频时输出**没有任何台阶**，这个交换在跟频场景下非常值。
+     *
+     *   ★ 双缓冲：铺到备用表再切指针，正在播的表一个字节都不动 ★ */
+    wave_fill_scratch(s_npts, phase0);
+    wave_swap();
+    s_dirty = 0U;
 
     /* 把归一化后的相位记下来，下次重铺要加上它（见步骤 0） */
     s_tab_phase = phase0 - (float)((int32_t)phase0);
@@ -630,7 +700,14 @@ void Signal_Init(void)
         return;                         /* 防止重复初始化 */
     }
     s_running = 1U;
-    wave_fill_n(SIN_MAX_POINTS, 0.0f);  /* 先铺一张满表（相位 0），SetFreq 里会按 N 重铺 */
+    /* 指针复位到第 0 张；先让"铺表目标"也指向它，把初表铺进去
+     * （此刻 DMA 还没跑，直接写正在用的表没问题），之后再让备用表指向另一张 */
+    sine_tab     = s_tab_mem[0];
+    s_fill_tab   = s_tab_mem[0];
+    s_tab_idx    = 0U;
+    s_swap_ready = 0U;
+    wave_fill_n(SIN_MAX_POINTS, 0.0f);
+    s_fill_tab   = s_tab_mem[1];        /* 之后铺表都铺到另一张上 */
     s_psc     = 0U;
     s_arr     = 0U;
     s_npts    = 1024U;
@@ -731,6 +808,14 @@ void Signal_SetFreq(float freq_hz)
     if (prd > 65536U)                   /* 16 位定时器的物理上限 */
     {
         prd = 65536U;
+    }
+
+    /* ★ 点数变了 → 表长度必须跟着变，得重铺一张 ★
+     *   只改频率、点数不变时不用铺 —— f = f_TIM/((PSC+1)*(ARR+1)*N)，
+     *   频率只跟 PSC/ARR 有关，表的内容一个字都不用改。 */
+    if (npts != s_live_n)
+    {
+        s_dirty = 1U;
     }
 
     s_psc  = psc;
@@ -898,16 +983,18 @@ void Signal_Realign(void)
      *     ② 如果点数或频率也变了，一并把 PSC/ARR 更新掉
      *   重铺一张正弦表要 N 次 sinf()（N=1022 约 1ms），会拉长这次中断，
      *   但只在参数真的变了时才发生（节流后最多 4 次/秒），可以接受。 */
-    if (s_dirty != 0U)
-    {
-        wave_fill_n(s_npts, s_phase_off);
-        s_live_n    = s_npts;
-        s_tab_phase = s_phase_off;
-        s_dirty     = 0U;
+    /* ★ 这里只"换指针"，绝不重铺表 ★
+     *   表已经在主循环里铺到备用表上了（那时 DMA 还在正常播，输出不受影响）。
+     *   切换本身只是指针交换，几纳秒 —— 再也不会冻结输出一个周期。
+     *   （原来在这里重铺，耗时 1ms，而 1kHz 的一个周期正好也是 1ms，
+     *     等于每次重铺都吃掉整整一个周期，那就是用户看到的"跳相"。）
+     *   wave_swap() 内部有 s_swap_ready 判断，没铺好时什么都不做。 */
+    wave_swap();
+    s_dirty = 0U;
 
-        __HAL_TIM_SET_PRESCALER(&htim6, s_psc);
-        __HAL_TIM_SET_AUTORELOAD(&htim6, s_arr);
-    }
+    /* PSC/ARR 都带预装载，写进去会在下一个更新事件生效 —— 无缝，不需要停表 */
+    __HAL_TIM_SET_PRESCALER(&htim6, s_psc);
+    __HAL_TIM_SET_AUTORELOAD(&htim6, s_arr);
 
     /* ---- 2) 关 DMA 请求 + 通道，清标志（绕开 HAL_DAC_Stop_DMA，见 signal_apply 坑 1）---- */
     DAC3->CR &= ~DAC_CR_DMAEN1;
