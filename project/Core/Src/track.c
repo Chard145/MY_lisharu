@@ -223,6 +223,11 @@ volatile uint32_t g_trk_vmax     = 0U;   /* 对方高电平码值 */
 volatile uint32_t g_trk_laps     = 0U;   /* ★ 因主循环太慢而丢掉整圈样本的次数（应该一直是 0）*/
 volatile uint32_t g_trk_reject   = 0U;   /* ★ 被假沿校验丢弃的过零点个数（假沿会直接拉偏频率）*/
 volatile uint32_t g_trk_raw_hz   = 0U;   /* ★ 原始测量值（只过中值，未平滑）—— 抖动诊断用 */
+volatile uint32_t g_trk_awd_irq  = 0U;   /* ★ AWD 中断总次数。正常 = 输入频率 × 2
+                                          *   （每周期一次上升沿 + 一次下降沿）。
+                                          *   明显偏高 = 有多余中断在触发假 Realign → 会跳相。 */
+volatile uint32_t g_trk_awd_heal = 0U;   /* ★ AWD 自愈次数。正常应一直是 0；
+                                          *   在涨说明阈值/窗口曾经错位（AWD 一度完全没中断）。 */
 
 /* ============================== 内部状态 ============================== */
 
@@ -312,6 +317,7 @@ static uint8_t  s_detected_wave = SIG_WAVE_SINE;
 
 static uint8_t  s_awd_arm_up;       /* AWD 窗口状态：1 = 等上升沿  0 = 等下降沿 */
 static uint32_t s_awd_thr = 2048U;  /* AWD 阈值 = 对方波形的直流中点（码值） */
+static uint32_t s_last_awd_cyc = 0U;/* 上次 AWD 中断的 DWT 周期数，供自愈安全网判断 */
 static uint8_t  s_phaselock_on;     /* 1 = 允许 AWD 中断去复位输出相位（有有效信号时才开） */
 
 static uint8_t  s_app_valid;        /* 下面几个"已经写进 signal.c 的值"是否有效 */
@@ -332,6 +338,7 @@ static void trk_duty_update(void);
 static void trk_wave_detect(void);
 static void trk_apply_waveform(void);
 static void trk_awd_set_thr(uint32_t thr);
+static void trk_awd_force(uint32_t thr);
 
 /* ============================== 内部函数 ============================== */
 
@@ -439,9 +446,25 @@ static void trk_env_update(void)
 
     /* AWD 的阈值取"稳定电平"的中点，比会衰减的 s_dc 更稳，
      * 阈值不抖 → AWD 不会在阈值附近反复触发。还没量够一个周期时退回 s_dc。 */
-    trk_awd_set_thr((s_lvl_valid != 0U)
-                    ? ((s_lvl_min + s_lvl_max) / 2U)
-                    : (uint32_t)s_dc);
+    {
+        uint32_t thr = (s_lvl_valid != 0U)
+                     ? ((s_lvl_min + s_lvl_max) / 2U)
+                     : (uint32_t)s_dc;
+
+        /* ★ 自愈安全网 ★
+         *   信号有效、却已经超过 20ms 没收到 AWD 中断 → 阈值/窗口一定错位了
+         *   （比如阈值比信号峰值还高，样本永远进不了窗口，AWD 永远不中断，
+         *    也就永远没机会自己恢复 —— 死锁）。
+         *   这时强制按当前阈值把窗口和状态机复位一次。 */
+        if ((uint32_t)(DWT->CYCCNT - s_last_awd_cyc) > (170000000U / 50U))
+        {
+            trk_awd_force(thr);
+        }
+        else
+        {
+            trk_awd_set_thr(thr);
+        }
+    }
 
     g_trk_valid    = 1U;
     s_phaselock_on = 1U;                /* 确认有有效信号了，才允许 AWD 中断复位输出相位 */
@@ -870,26 +893,105 @@ static void trk_awd_init(void)
 }
 
 /**
-  * @brief  阈值跟着对方的直流中点走
-  * @note   由 trk_env_update() 在 s_dc 变化时调用，顺便把当前窗口按新阈值重设。
+  * @brief  更新 AWD 阈值（= 对方波形的直流中点）并重设窗口
+  *
+  * ★★★ 必须"改阈值"和"重设窗口"一起做，而且要做成原子的（2026-10-12 两次踩坑）★★★
+  *
+  *   【坑 A：只改阈值、不重设窗口 → 死锁】
+  *     最初这里是"改阈值 + 按当前状态重设窗口"一起做的。
+  *     后来为了躲竞态，我把它改成"只改 s_awd_thr 变量，窗口留给 ISR 翻" ——
+  *     结果**死锁**：窗口初始是 [0, 2047]（阈值默认 2048），
+  *     而小幅度信号（比如 pk 只有 1100）的样本永远到不了 2048，
+  *     AWD 就永远不触发 → 窗口永远不翻 → 新阈值永远没机会生效。
+  *     现象：g_trk_awd_irq 一直是 0、g_trk_edges 一直是 0，
+  *     也就是 **Signal_Realign() 一次都没执行、相位根本没在对齐**，
+  *     输出只是自由跑，相对输入一直漂 —— 用户看到的就是"几乎每秒都在跳相"。
+  *
+  *   【坑 B：改窗口和 ISR 抢寄存器 → 状态反掉】
+  *     而如果直接改回去（不加保护），又会和 ISR 抢：
+  *     主循环读到 arm==1 准备写"等上升沿"的窗口，此刻 ISR 正好把状态翻成 0，
+  *     主循环仍按旧状态写回 → 窗口和状态机反了 → 下一个样本又触发一次 AWD
+  *     → 多执行一次 Signal_Realign() → 输出相位被莫名复位。
+  *
+  *   【正解：短暂关中断，把"改阈值 + 重设窗口"做成原子操作】
+  *     主循环与 ISR 不会同时执行，关掉中断（十几个周期，约 0.1us）就能保证
+  *     窗口内容和 s_awd_arm_up 严格一致，两个坑同时避开。
   */
 static void trk_awd_set_thr(uint32_t thr)
 {
+    uint32_t d;
+    uint32_t primask;
+
     if (thr < TRK_AWD_THR_MIN) { thr = TRK_AWD_THR_MIN; }
     if (thr > TRK_AWD_THR_MAX) { thr = TRK_AWD_THR_MAX; }
 
-    if (thr != s_awd_thr)
+    d = (thr > s_awd_thr) ? (thr - s_awd_thr) : (s_awd_thr - thr);
+    if (d < 8U)
     {
-        s_awd_thr = thr;
-        if (s_awd_arm_up != 0U)
-        {
-            trk_awd_window(0U, thr - 1U);       /* 等上升沿 */
-        }
-        else
-        {
-            trk_awd_window(thr, 4095U);         /* 等下降沿 */
-        }
+        return;                         /* 抖动太小，不动（迟滞），免得频繁改窗口 */
     }
+
+    primask = __get_PRIMASK();
+    __disable_irq();                    /* ★ 原子：期间 ISR 不会插进来改状态 ★ */
+
+    s_awd_thr = thr;
+    if (s_awd_arm_up != 0U)
+    {
+        trk_awd_window(0U, thr - 1U);   /* 等上升沿 */
+    }
+    else
+    {
+        trk_awd_window(thr, 4095U);     /* 等下降沿 */
+    }
+    ADC2->ISR = ADC_ISR_AWD1;           /* 清掉这期间可能挂起的标志，保证状态一致 */
+
+    __set_PRIMASK(primask);
+}
+
+/**
+  * @brief  ★ 安全网：忽略迟滞，强制按给定阈值把窗口和状态机复位到"等上升沿" ★
+  *
+  *   为什么需要它：阈值/窗口一旦错位（比如阈值比信号峰值还高，样本永远进不了窗口），
+  *   AWD 就永远不中断 → 窗口永远不翻 → 正常路径也没机会把它修回来 ——
+  *   **死锁**。踩过一次：AWD 一次都没触发，相位完全没在对齐却没有任何报错，
+  *   表现就是"几乎每秒都在跳相"。
+  *
+  *   所以加一道保险：只要"信号有效但 AWD 超过 20ms 没中断"，就强制重设一次。
+  *   正常运行时这条永远不会触发（1kHz 信号每 0.5ms 就该中断一次）。
+  */
+static void trk_awd_force(uint32_t thr)
+{
+    uint32_t primask;
+
+    if (thr < TRK_AWD_THR_MIN) { thr = TRK_AWD_THR_MIN; }
+    if (thr > TRK_AWD_THR_MAX) { thr = TRK_AWD_THR_MAX; }
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+
+    s_awd_thr = thr;
+
+    /* ★ 关键：状态必须跟"当前信号电平"一致，不能一律设成"等上升沿" ★
+     *   如果一律设成等上升沿，而信号此刻正好是高电平，
+     *   下一个样本就会立刻满足"样本 ≥ 阈值" → ISR 把它当成一次上升沿
+     *   → 在错误时刻调用 Signal_Realign() → **又一次相位跳变**。
+     *   自愈本来是保险，反而制造跳相就本末倒置了。
+     *   所以看最后一个已处理样本 s_prev 落在哪边，据此设置状态。 */
+    if (s_prev > (int32_t)thr)
+    {
+        s_awd_arm_up = 0U;              /* 现在就是高电平 → 等下降沿 */
+        trk_awd_window(thr, 4095U);
+    }
+    else
+    {
+        s_awd_arm_up = 1U;              /* 现在低于阈值 → 等上升沿 */
+        trk_awd_window(0U, thr - 1U);
+    }
+    ADC2->ISR = ADC_ISR_AWD1;
+
+    __set_PRIMASK(primask);
+
+    g_trk_awd_heal++;
 }
 
 /**
@@ -902,6 +1004,8 @@ void ADC1_2_IRQHandler(void)
     if ((ADC2->ISR & ADC_ISR_AWD1) != 0U)
     {
         ADC2->ISR = ADC_ISR_AWD1;               /* 写 1 清标志 */
+        g_trk_awd_irq++;
+        s_last_awd_cyc = DWT->CYCCNT;
 
         if (s_awd_arm_up != 0U)
         {
@@ -1198,6 +1302,7 @@ void Track_Init(void)
     DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
     s_cyc_base  = DWT->CYCCNT;
     s_lp_cyc    = s_cyc_base;           /* 低通 dt 的起点 */
+    s_last_awd_cyc = s_cyc_base;        /* AWD 自愈安全网的计时起点 */
 
     /* s_rd 是"下一个要处理的缓冲下标"，s_total 是对应的全局样本号。
      * 两者必须同步推进：s_rd == (初始fill + s_total) % ADC_BUF_LEN。 */

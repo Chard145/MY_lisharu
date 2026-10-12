@@ -124,6 +124,16 @@ extern volatile uint32_t g_trk_reject;
  *   想看"测频本身干不干净"就读这个；想看"实际用了多少"就读 Track_GetInFreq()。 */
 extern volatile uint32_t g_trk_raw_hz;
 
+/* ★ AWD 中断总次数。正常应该正好 = 输入频率 × 2（每周期一次上升沿 + 一次下降沿触发）。
+ *   明显偏高 = 有多余中断，会多执行 Signal_Realign() → 输出相位被莫名复位 → 跳相。
+ *   历史上就是因为主循环也去写 AWD 窗口、和 ISR 抢寄存器，造成窗口状态反掉。 */
+extern volatile uint32_t g_trk_awd_irq;
+
+/* ★ AWD 自愈次数。正常应**一直是 0**。
+ *   在涨说明阈值/窗口曾经错位到"AWD 完全收不到中断"的程度
+ *   （那样相位就完全没在对齐，但不会有任何报错，只是输出看着一直在跳相）。 */
+extern volatile uint32_t g_trk_awd_heal;
+
 /* ============================== 诊断计数（J-Link 可直接读）============================== */
 extern volatile uint32_t g_trk_measures;   /* 算出频率结果的次数 */
 extern volatile uint32_t g_trk_updates;    /* 真正调用 Signal_SetFreq() 的次数 */
