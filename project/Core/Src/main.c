@@ -131,9 +131,10 @@ int main(void)
   Uart_Echo_Init();             /* 启动 USART1 不定长接收（DMA + 空闲中断） */
   Adc_Vofa_Init();              /* 启动 ADC2 采集(500kSPS) + DMA，发 VOFA+ */
   Track_Init();                 /* ★ 跟踪器：必须在 Adc_Vofa_Init() 之后（复用它的 adc_buf） */
-  /* ★ 圆发生版本：输出相对输入提前 90°，与等幅输入组成圆形李萨如图形 */
-  Signal_SetPhaseDeg(90.0f);
-  Debug_RTT_Println("boot: all modules started (circle Lissajous mode)");
+  /* ★ 无穷发生版本：输出频率为输入 2 倍、相位从输入上升沿 0° 开始，
+   *   与 x=sin(wt) 组成标准 2:1 李萨如无穷图形。 */
+  Signal_SetPhaseDeg(0.0f);
+  Debug_RTT_Println("boot: all modules started (infinity Lissajous mode)");
 
   /* ---- RTT 调试输出用法（不需要时可删）---------------------------------
    * printf 已被重定向到 RTT，J-Link RTT Viewer 里直接能看到：

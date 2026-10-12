@@ -178,6 +178,12 @@
  *   代价是"对方幅度/占空比变了"最多延迟 250ms 才跟上 —— 完全可以接受。 */
 #define TRK_PARAM_MIN_MS    250U
 
+/* 李萨如图形模式：输出频率相对输入的倍频系数。
+ *   1.0 = 斜线/圆发生（同频）
+ *   2.0 = 无穷发生（x=sin(wt), y=sin(2wt)）
+ * 相位仍由输入上升沿 Realign 到表头相位 0。 */
+#define TRK_OUTPUT_FREQ_MULT  2.0f
+
 /* ============================== 开环测试模式 ==============================
  * ★★ 为什么需要这个开关：自监控闭环会失控 ★★
  *
@@ -735,23 +741,29 @@ static void trk_maybe_measure(void)
         }
     }
 
-    if (s_out_hz < SIGNAL_FREQ_MIN) { s_out_hz = SIGNAL_FREQ_MIN; }
-    if (s_out_hz > SIGNAL_FREQ_MAX) { s_out_hz = SIGNAL_FREQ_MAX; }
-
-    g_trk_out_hz = (uint32_t)(s_out_hz + 0.5f);
-
-    /* ---- 第三级：死区 + 最小更新间隔，才真正去动 DAC ---- */
+    /* 图形模式的最后一级：先把跟踪频率乘倍频系数，再限制到 DAC 可输出范围。
+     * 频率测量/锁相仍以输入基频为准；这里只改变 DAC 的 y 轴轨迹频率。 */
     {
-        float    need = (s_set_hz <= 0.0f)
-                      || (fabsf(s_out_hz - s_set_hz) > (TRK_DEADBAND * s_set_hz));
-        uint32_t now  = HAL_GetTick();
+        float out_cmd = s_out_hz * TRK_OUTPUT_FREQ_MULT;
 
-        if (need && ((uint32_t)(now - s_last_upd_ms) >= TRK_MIN_UPDATE_MS))
+        if (out_cmd < SIGNAL_FREQ_MIN) { out_cmd = SIGNAL_FREQ_MIN; }
+        if (out_cmd > SIGNAL_FREQ_MAX) { out_cmd = SIGNAL_FREQ_MAX; }
+
+        g_trk_out_hz = (uint32_t)(out_cmd + 0.5f);
+
+        /* ---- 第三级：死区 + 最小更新间隔，才真正去动 DAC ---- */
         {
-            Signal_SetFreq(s_out_hz);
-            s_set_hz      = s_out_hz;
-            s_last_upd_ms = now;
-            g_trk_updates++;
+            float    need = (s_set_hz <= 0.0f)
+                          || (fabsf(out_cmd - s_set_hz) > (TRK_DEADBAND * s_set_hz));
+            uint32_t now  = HAL_GetTick();
+
+            if (need && ((uint32_t)(now - s_last_upd_ms) >= TRK_MIN_UPDATE_MS))
+            {
+                Signal_SetFreq(out_cmd);
+                s_set_hz      = out_cmd;
+                s_last_upd_ms = now;
+                g_trk_updates++;
+            }
         }
     }
 }
