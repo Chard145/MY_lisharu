@@ -46,6 +46,7 @@
 #include "tim.h"
 #include "usart.h"
 #include "signal.h"        /* Signal_GetFreq()：用来算自适应降采样倍数 */
+#include "track.h"         /* Track_GetInFreq()：跟频系统里屏幕上显示的是对方的波 */
 #include "debug_rtt.h"     /* SEGGER RTT：ADC_VOFA_LINK=1 时的数据出口 */
 #include "SEGGER_RTT.h"    /* SEGGER_RTT_GetAvailWriteSpace()：RTT 通路的限速判据 */
 #include <string.h>
@@ -74,13 +75,14 @@ void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 static uint16_t adc_buf[ADC_BUF_LEN];              /* DMA 目标：全局、uint16_t、自然对齐 */
 
 /* 发送缓冲。只在上一次 DMA 发完(gState==READY)时才写，所以一份就够。
- *   波形流：每点 = 4 字节 float 电压 + 4 字节 float 频率 + 4 字节帧尾 = 12 字节
+ *   波形流(3 通道)：每点 = 4 字节 float 电压 + 4 字节 float 输入测频
+ *                          + 4 字节 float 输出频率 + 4 字节帧尾 = 16 字节
  *           ★ 帧尾是 4 字节(0x00 0x00 0x80 0x7F)，不是 1 字节！
  *             按 ×5 算过，结果 tx_buf 越界 768 字节踩掉后面的计数器。
- *           ★ 2026-10-12 加了频率通道后是 ×12，改点数的宏时记得同步复核这里。
+ *           ★ 2026-10-12 加到 3 通道后是 ×16，改点数的宏时记得同步复核这里。
  *   摘要  ：4 通道 × 12 字节 + 1       = 49 字节，留 96 足够 */
 #if (ADC_VOFA_MODE != 0)
-#define ADC_TX_BUF_LEN      (ADC_VOFA_POINTS * 12U)
+#define ADC_TX_BUF_LEN      (ADC_VOFA_POINTS * 16U)
 #else
 #define ADC_TX_BUF_LEN      96U
 #endif
@@ -227,6 +229,14 @@ uint16_t Adc_Vofa_Raw(uint32_t idx)
     return adc_buf[idx];
 }
 
+/**
+  * @brief  取整块采样缓冲的首地址（给 track.c 批量扫描用，避免逐点函数调用）
+  */
+const uint16_t *Adc_Vofa_BufBase(void)
+{
+    return adc_buf;
+}
+
 #if (ADC_VOFA_MODE != 0)
 /* ========================================================================
  *                        波形流模式（示波器显示）
@@ -288,15 +298,15 @@ static uint32_t adc_find_trigger(uint32_t mid, uint32_t pk)
 /**
   * @brief  组一帧波形：从触发点开始，按 decim 取 ADC_VOFA_POINTS 个点。
   *
-  * ★ 每帧是 2 个通道（2026-10-12 加）★
-  *     通道0 = 电压(V)，通道1 = 当前 DAC 设定频率(Hz)
-  *   每点 = [float 电压][float 频率][帧尾 0x00 0x00 0x80 0x7F] = 12 字节
+  * ★ 每帧是 3 个通道（2026-10-12 从 2 通道扩到 3）★
+  *     通道0 = 电压(V)          —— 对方的波形
+  *     通道1 = 测到的对方频率(Hz) —— Track_GetInFreq()
+  *     通道2 = 本机输出频率(Hz)   —— Signal_GetFreq()
+  *   每点 = [f 电压][f 输入频率][f 输出频率][帧尾 0x00 0x00 0x80 0x7F] = 16 字节
   *
-  *   为什么要带上频率：扫频测幅度时，必须知道每个采样点对应哪个频点，
-  *   否则只能靠"数时间"去对齐扫频步进，一有丢帧就全乱。
-  *   频率直接进数据流后，VOFA+ 能看见（做成阶梯线），
-  *   自检脚本也能直接按频率分组统计峰峰值 —— 不用猜。
-  *   （代价：帧从 8 字节/点涨到 12 字节/点，RTT 通路带宽完全够。）
+  *   为什么要带频率：跟频系统里最关键的判据就是"输出的频率是不是等于对方的频率"。
+  *   两个频率一起进数据流后，在 VOFA+ 里把通道1/通道2 拖到同一张图，
+  *   两条线重合就说明跟上了 —— 不用示波器、不用数时间。
   *
   * @retval 帧字节数
   */
@@ -306,27 +316,31 @@ static uint16_t adc_build_wave(uint32_t start, uint32_t decim)
     uint32_t n = 0U;
     uint32_t idx = start;
     uint32_t i;
-    float    freq = (float)g_adc_freq_hz;   /* 本帧内频率恒定，反映当前扫频档位 */
+    /* 本帧内两个频率都当常量：一帧只跨几毫秒，期间频率不会变 */
+    float    f_in  = Track_GetInFreq();
+    float    f_out = Signal_GetFreq();
 
     for (i = 0U; i < ADC_VOFA_POINTS; i++)
     {
         float v = (float)adc_buf[idx] * (ADC_VREF_MV / 1000.0f) / 4095.0f;
 
-        if ((n + 12U) > (uint32_t)ADC_TX_BUF_LEN)
+        if ((n + 16U) > (uint32_t)ADC_TX_BUF_LEN)
         {
             break;                      /* 保险：绝不越界（改 POINTS 后也不会再踩内存） */
         }
 
-        memcpy(&p[n], &v, 4U);          /* 小端 float32，与 JustFloat 一致 */
+        memcpy(&p[n], &v,     4U);      /* 通道0：电压 */
         n += 4U;
-        memcpy(&p[n], &freq, 4U);       /* 通道1：DAC 设定频率 */
+        memcpy(&p[n], &f_in,  4U);      /* 通道1：测到的对方频率(Hz) */
+        n += 4U;
+        memcpy(&p[n], &f_out, 4U);      /* 通道2：本机输出频率(Hz) */
         n += 4U;
         p[n++] = 0x00U;                 /* 帧尾：0x00 0x00 0x80 0x7F（4 字节） */
         p[n++] = 0x00U;
         p[n++] = 0x80U;
         p[n++] = 0x7FU;
 
-        idx += decim;                   /* 环形前进（decim <= 16，减一次必够） */
+        idx += decim;                   /* 环形前进（decim <= 8，减一次必够） */
         if (idx >= ADC_BUF_LEN)
         {
             idx -= ADC_BUF_LEN;
@@ -372,9 +386,17 @@ void Adc_Vofa_Poll(void)
     g_adc_min_raw  = mn;
     g_adc_max_raw  = mx;
 
-    /* ---- 2) 自适应降采样倍数（跟着 DAC 频率走）---- */
+    /* ---- 2) 自适应降采样倍数 ----
+     * ★ 跟频系统里，屏幕上显示的是**对方**的波，所以这里必须用"测到的输入频率"
+     *   来选降采样倍数，否则 1 个周期在屏上只占几个点。
+     *   输入还没测出来时（s_in_hz=0）退回到 DAC 设定频率，至少不失控。 */
     {
-        float f = Signal_GetFreq();
+        float f = Track_GetInFreq();
+
+        if (f < 1.0f)
+        {
+            f = Signal_GetFreq();
+        }
         g_adc_freq_hz = (uint32_t)(f + 0.5f);
         decim = adc_calc_decim(f);
     }

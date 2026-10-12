@@ -89,10 +89,10 @@
  *   波形立刻变成完整的漂亮正弦。原因未完全定论（怀疑与 DMA 对 Flash 读取
  *   的位宽/时序有关），但**实测结论明确**，所以采用运行时生成方案。
  *
- * 表值定义：sine_tab[i] = round(2048 + 2047.5 * sin(2*pi*i/1024))
+ * 表值定义：sine_tab[i] = round(2048 + 2047.5 * sin(2*pi*(i/N + phase0)))
  *   中心 2048 -> 1.65V；满幅 0~4095 -> 0~3.3V
- *   首点 = 2048（过零点），换频时从过零重新起振，相位不跳变
- * 高频段只用前 N 个点（N 是 1024 的约数），所以一张表通吃所有频段。
+ *   phase0 = 0 时首点 = 2048（过零点）；非 0 时按当前输出相位生成，
+ *   换频时波形无缝接上，**不再有相位台阶**（原因见下面 sine_fill_n 的说明）。
  * 元素类型必须是 uint32_t —— 和 DMA 的 Word 传输宽度严格一致。
  */
 static uint32_t sine_tab[SIN_MAX_POINTS];
@@ -124,9 +124,28 @@ static uint32_t sine_tab[SIN_MAX_POINTS];
   *   就永远输出完整正弦。（频率公式本来就是对的，错的是表的内容。）
   *
   * 表值：round(2048 + 2047.5*sin(...))，中心 2048 -> 1.65V，满幅 0~4095 -> 0~3.3V。
-  * 首点 = 2048（过零点），换频时从过零重新起振，相位不跳变。
+  *
+  * ================ ★ 相位连续（2026-10-12 加，为频率跟踪而改）★ ================
+  *   原来每次换频都从相位 0 重新起振，配合 signal_apply() 里那句
+  *       DAC3->DHR12R1 = sine_tab[0];       （= 中点 1.65V）
+  *   会在输出上留下一个**直接跳到中点的台阶**。
+  *
+  *   以前扫频测失真时看不出来（1.5 秒才换一次档）；但做频率跟踪之后换频可能
+  *   每秒几百次，而且——自监控（PB15 接回 PA2）时那个台阶会被自己的 ADC 采到：
+  *   信号当时若在负半周，台阶就是一次"上升沿穿越阈值"，于是多数出一个沿
+  *   → 测得的频率偏高 → 输出调高 → 换频更频繁 → 更多假沿。
+  *   实测就是一路从 1kHz 爬到 17kHz 的**正反馈失控**。
+  *
+  *   改法：铺表时带上**起始相位** phase0（单位"周期"，0~1）：
+  *       sine_tab[i] = 2048 + 2047.5 * sin(2*pi*(i/n + phase0))
+  *   换频前先从 DMA 的 CNDTR 反推当前播到第几个点，换算成 phase0 再重铺，
+  *   这样表首点恰好等于"输出此刻的值"，重启后波形无缝接上，台阶消失。
+  *   phase0 = 0 时行为与改动前完全一致。
+  *
+  * @param  n      每周期点数
+  * @param  phase0 起始相位，单位"周期"，任意实数（内部归一化到 [0,1)）
   */
-static void sine_fill_n(uint32_t n)
+static void sine_fill_n(uint32_t n, float phase0)
 {
     uint32_t i;
 
@@ -139,9 +158,17 @@ static void sine_fill_n(uint32_t n)
         n = SIN_MAX_POINTS;
     }
 
+    /* 归一化到 [0,1)，防止调用方传进来越界的相位 */
+    phase0 = phase0 - (float)((int32_t)phase0);
+    if (phase0 < 0.0f)
+    {
+        phase0 += 1.0f;
+    }
+
     for (i = 0U; i < n; i++)
     {
-        float ang = 6.28318530718f * (float)i / (float)n;   /* 2*pi*i/n */
+        /* 2*pi*(i/n + phase0) */
+        float ang = 6.28318530718f * ((float)i / (float)n + phase0);
         float v   = 2048.0f + 2047.5f * sinf(ang);
 
         if (v < 0.0f)
@@ -218,7 +245,10 @@ static uint8_t  s_running = 0U;         /* 是否已启动 */
 static uint32_t s_psc     = 0U;         /* 当前预分频值 */
 static uint32_t s_arr     = 0U;         /* 当前重装载值 */
 static uint32_t s_npts    = 1024U;      /* 当前使用的表点数 */
-static uint32_t s_last_npts = 0U;       /* 上次铺表用的点数，变了才重铺 */
+static uint32_t s_live_n  = 0U;         /* ★ 正在 DMA 上跑的表长，用来反推当前相位 */
+static float    s_tab_phase = 0.0f;     /* ★ 当前正弦表里已经烘焙进去的相位偏移(0~1)
+                                         *   输出相位 = dma下标/N + s_tab_phase
+                                         *   重铺表时忘了加它就会跳一下，见 signal_apply 步骤 0 */
 
 /**
   * @brief  求 k = max{ k | 10*2^(k-1) <= freq_hz }，纯整数运算，避免引入 math.h
@@ -262,6 +292,7 @@ static uint32_t band_index(float freq_hz)
 static void signal_apply(void)
 {
     DMA_Channel_TypeDef *ch = NULL;
+    float    phase0 = 0.0f;             /* 本刻的输出相位（单位"周期"） */
 
     if (s_running == 0U)
     {
@@ -272,6 +303,61 @@ static void signal_apply(void)
     {
         ch = (DMA_Channel_TypeDef *)hdac3.DMA_Handle1->Instance;
     }
+
+    /* ==================== ★★ 快路径：点数没变，就只动定时器 ★★ ====================
+     *
+     * 为什么必须要有这条快路径（2026-10-12 实测定位）：
+     *
+     *   走下面的慢路径时，每次换频都要 sine_fill_n() 重铺整张表，
+     *   而表里每个点都要调一次 sinf()。N=1022 时这一步要跑约 0.5ms，
+     *   期间 TIM6 是停的、DMA 是停的 → **DAC 输出被冻在最后一个值上**。
+     *
+     *   扫频时无所谓（1.5 秒才换一次档）。但频率跟踪每秒会调几十次
+     *   Signal_SetFreq()，等于每秒有几十毫秒输出是"死"的。
+     *   自监控时测量窗口只有 1.02ms（512 点 @500kSPS），经常整窗落在冻结点上，
+     *   于是峰峰值骤降到几百个码值 → 判定"没信号" → 触发重置 → 又强制换频 → 又冻结，
+     *   形成第二个正反馈。实测现象就是 pk 在 220 和 4095 之间乱跳、resets 每秒涨 125。
+     *
+     *   关键观察：**只要点数 N 没变，表的内容就一个字都不用改** ——
+     *       f = f_TIM / ((PSC+1) * (ARR+1) * N)
+     *   频率只跟 PSC/ARR 有关。DMA 一直在循环搬同一张表，相位天然就是连续的，
+     *   DMA 通道、CMAR、CNDTR **统统不用碰**。
+     *   所以这条路径只重设 TIM6 的 PSC/ARR，耗时几微秒，输出几乎没有空档。
+     *
+     *   代价：停表/重启会截断当前这个 TIM6 周期，相当于输出相位偏了不到
+     *   1/N 个周期（N=1022 时是 0.1%），肉眼看不出；
+     *   换来的是"换频不再冻结输出"，这个交换非常值。 */
+    if ((ch != NULL) && (s_live_n > 0U) && (s_npts == s_live_n))
+    {
+        __HAL_TIM_DISABLE(&htim6);
+        __HAL_TIM_SET_PRESCALER(&htim6, s_psc);
+        __HAL_TIM_SET_AUTORELOAD(&htim6, s_arr);
+        __HAL_TIM_SET_COUNTER(&htim6, 0U);
+        htim6.Instance->EGR = TIM_EGR_UG;
+        __HAL_TIM_ENABLE(&htim6);
+        return;
+    }
+
+    /* 0) ★ 动任何寄存器之前，先把"当前输出相位"取出来 ★
+     *    DMA 循环模式下 CNDTR 从 s_live_n 递减到 0 再回绕，所以
+     *        已传输点数 = s_live_n - CNDTR
+     *    就是"下一次要搬的表下标"，也就是此刻在本表里的位置。
+     *
+     *    ★ 别漏了 s_tab_phase ★
+     *      输出相位 = 表内位置/N + 表自身烘焙的相位偏移。
+     *      只算 done/N 的话，等于假设表是从相位 0 开始的 ——
+     *      而重铺过的表并不是。漏掉它的后果是每次重铺都跳一下，
+     *      幅度最大可达满量程，正是我们要消掉的那个台阶。 */
+    if ((ch != NULL) && (s_live_n > 0U) && (ch->CNDTR <= s_live_n))
+    {
+        uint32_t done = s_live_n - ch->CNDTR;
+
+        if (done < s_live_n)
+        {
+            phase0 = (float)done / (float)s_live_n;
+        }
+    }
+    phase0 += s_tab_phase;              /* 加上表里已有的相位偏移 */
 
     /* 1) 先掐掉触发源，避免改配置的过程中有半截触发进来 */
     __HAL_TIM_DISABLE(&htim6);
@@ -285,6 +371,21 @@ static void signal_apply(void)
         DMA1->IFCR = 0x0FUL;            /* 清通道1 全部中断标志 */
     }
     DAC3->SR = DAC_SR_DMAUDR1;          /* 清 DMA 欠载标志，避免卡住后续传输 */
+
+    /* 2.5) ★ 按刚才取到的相位重铺正弦表 ★
+     *   必须在这里（DMA 已停、表还没被引用）重铺，而且**每次换频都要铺**，
+     *   不能只在 N 变化时铺 —— 因为相位每刻都在变。
+     *   代价是每次换频多 N 次 sinf()（N 最大 1024，约几十微秒），
+     *   换来的是换频时输出**没有任何台阶**，这个交换在跟频场景下非常值。 */
+    sine_fill_n(s_npts, phase0);
+    s_live_n = s_npts;
+
+    /* 把归一化后的相位记下来，下次重铺要加上它（见步骤 0） */
+    s_tab_phase = phase0 - (float)((int32_t)phase0);
+    if (s_tab_phase < 0.0f)
+    {
+        s_tab_phase += 1.0f;
+    }
 
     /* 3) 改 TIM6 的 PSC/ARR，并手动发一次 UG 事件把影子寄存器刷新成新值。
      *    必须停表再改，否则 PSC 是带缓冲的，会出现一整个周期的错拍。 */
@@ -310,7 +411,10 @@ static void signal_apply(void)
         __HAL_DMA_DISABLE_IT(hdac3.DMA_Handle1, DMA_IT_TC | DMA_IT_HT | DMA_IT_TE);
     }
 
-    /* 5) 预置首点（1.65V 过零点，换频时相位不跳），再使能 DMA 请求，最后放开时钟。
+    /* 5) 预置首点，再使能 DMA 请求，最后放开时钟。
+     *    ★ 因为表已经按"当前相位"重铺（见步骤 0 / 2.5），sine_tab[0] 恰好等于
+     *      输出此刻的值，所以这次预置**不产生台阶** —— 正是靠这一点，
+     *      自监控闭环才不会因为换频台阶多数出沿而失控。
      *    注意这里**不碰 HAL_DAC_Start()** —— 见坑 2。 */
     DAC3->DHR12R1 = sine_tab[0];
     DAC3->CR |= DAC_CR_DMAEN1;
@@ -403,10 +507,11 @@ void Signal_Init(void)
         return;                         /* 防止重复初始化 */
     }
     s_running = 1U;
-    sine_fill_n(SIN_MAX_POINTS);        /* 先铺一张满表，SetFreq 里会按 N 重铺 */
-    s_psc  = 0U;
-    s_arr  = 0U;
-    s_npts = 1024U;
+    sine_fill_n(SIN_MAX_POINTS, 0.0f);  /* 先铺一张满表（相位 0），SetFreq 里会按 N 重铺 */
+    s_psc     = 0U;
+    s_arr     = 0U;
+    s_npts    = 1024U;
+    s_live_n  = 0U;                     /* DMA 还没跑过，相位视为 0 */
 
     /* ★ 这里**不要**去改 DAC3->MCR。实测结论（2026-10-12）：
      *   CubeMX 生成的 dac.c 里是
@@ -507,16 +612,11 @@ void Signal_SetFreq(float freq_hz)
     s_arr  = prd - 1U;
     s_npts = npts;
 
-    /* ★★ 关键：点数变了必须按新的 N 重铺正弦表 ★★
-     *   N 个点必须恰好是一个完整周期，否则播放出来的是一段"上升斜坡"
-     *   而不是正弦（见 sine_fill_n 的说明）。
-     *   铺表放在改硬件之前，保证 DMA 一旦启动拿到的就是新表。 */
-    if (npts != s_last_npts)
-    {
-        sine_fill_n(npts);
-        s_last_npts = npts;
-    }
-
+    /* ★ 铺表的活儿已经挪到 signal_apply() 里了 ★
+     *   原来这里写的是"点数变了才重铺"，现在不够用了 ——
+     *   要做到换频无台阶，必须**每次都按当前相位重铺**，
+     *   而相位只有在 signal_apply() 里读 DMA 的 CNDTR 才拿得到。
+     *   见 signal_apply() 的步骤 0（取相位）和 2.5（重铺）。 */
     signal_apply();
 }
 

@@ -30,7 +30,8 @@
 /* USER CODE BEGIN Includes */
 #include "signal.h"          /* DAC+TIM6+DMA  */
 #include "uart_echo.h"       /* USART1 不定长收发（DMA + 空闲中断） */
-#include "adc_vofa.h"        /* ADC2(20kHz, TIM7触发) -> VOFA+ (JustFloat) */
+#include "adc_vofa.h"        /* ADC2(500kSPS, TIM7触发) -> VOFA+ (JustFloat) */
+#include "track.h"           /* ★ 频率跟踪：ADC 采对方的波 -> 测频 -> DAC 输出同频正弦 */
 #include "debug_rtt.h"       /* SEGGER RTT 调试输出（走 SWD，不占 UART/引脚） */
 /* USER CODE END Includes */
 
@@ -120,12 +121,17 @@ int main(void)
    *
    * 注：G4 的 OPAMP 没有独立时钟门控（CubeMX 里该 IP 是 ClockEnableMode="none"，
    *     芯片头文件里也没有 __HAL_RCC_OPAMP_CLK_ENABLE 这个宏），所以不需要开时钟。 */
-  Signal_Sweep_Init();          /* 启动 4Hz~700Hz 扫频（非阻塞），内部会起 DAC3 */
+  /* ★★ 跟频系统：输出频率由 Track_Poll() 根据"对方的波"实时决定 ★★
+   *   所以这里**不能**再调 Signal_Sweep_Init() 的扫频 ——
+   *   扫频和跟踪器会抢着调 Signal_SetFreq()，输出会变成一团乱跳。
+   *   要扫频做失真度对比时，把下面 Signal_Init() 换回 Signal_Sweep_Init() 即可。 */
+  Signal_Init();                /* 启动 DAC3，先给一个 1kHz 的默认输出 */
   HAL_OPAMP_Start(&hopamp1);    /* ★ 运放启动：必须晚于 DAC3 */
 
   Uart_Echo_Init();             /* 启动 USART1 不定长接收（DMA + 空闲中断） */
-  Adc_Vofa_Init();              /* 启动 ADC2 采集(20kHz) + DMA，准备发 VOFA+ */
-  Debug_RTT_Println("boot: all modules started");
+  Adc_Vofa_Init();              /* 启动 ADC2 采集(500kSPS) + DMA，发 VOFA+ */
+  Track_Init();                 /* ★ 跟踪器：必须在 Adc_Vofa_Init() 之后（复用它的 adc_buf） */
+  Debug_RTT_Println("boot: all modules started (frequency tracking mode)");
 
   /* ---- RTT 调试输出用法（不需要时可删）---------------------------------
    * printf 已被重定向到 RTT，J-Link RTT Viewer 里直接能看到：
@@ -144,9 +150,22 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    Signal_Sweep_Step();        /* 扫频推进（非阻塞，到时间才换档） */
+    /* ★ 注意：这里**故意不调 Signal_Sweep_Step()** ★
+     *   它的 s_last_tick 初值是 0，就算没调 Init，第一次进函数
+     *   (HAL_GetTick() - 0) >= 1500 立刻成立 → 马上 Signal_SetFreq(500Hz)，
+     *   然后每 1.5 秒换一档，把跟踪器的输出冲掉。
+     *   所以跟频模式下必须整个摘掉它。
+     *   要回去做扫频失真度对比：把 Signal_Init() 换成 Signal_Sweep_Init()、
+     *   这里加回 Signal_Sweep_Step()、并把 Track_Poll() 注释掉。 */
     Uart_Echo_Poll();           /* 串口轮询：每 2ms 取走 DMA 收到的数据并回发 */
+    Track_Poll();               /* ★ 跟频核心：测对方的频率 → 驱动 DAC 输出同频正弦 */
     Adc_Vofa_Poll();            /* ADC 轮询：取一整窗波形降采样后发到 VOFA+ 示波器 */
+
+    /* ★ 这里**不要**再往 RTT 打周期性的文本日志 ★
+     *   ADC_VOFA_LINK=1 时，VOFA+ 的 JustFloat 二进制流走的也是 RTT **通道 0**，
+     *   插一行文本进去 = 往字节流里塞垃圾，VOFA+ 的帧解析会错位。
+     *   跟频状态已经作为通道1/通道2 进了 VOFA+ 数据流，看波形图就够了；
+     *   真要文本排查，用 J-Link 直接读 g_trk_* 这些全局变量。 */
     /* 串口收发由 DMA + 空闲中断在后台完成，主循环不用管 */
   }
   /* USER CODE END 3 */

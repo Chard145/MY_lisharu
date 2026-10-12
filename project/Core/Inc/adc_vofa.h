@@ -102,10 +102,21 @@ extern "C" {
  * 想要更流畅：把 CubeMX 里 USART1 波特率提到 921600，帧时间直接 /8。
  * ★ 一帧的原始跨度 = POINTS × 降采样倍数，不能超过 ADC_BUF_LEN。 */
 #if (ADC_VOFA_LINK != 0)
-#define ADC_VOFA_POINTS     512U
+#define ADC_VOFA_POINTS     256U
 #else
 #define ADC_VOFA_POINTS     128U
 #endif
+
+/* ★ 波形流模式的通道数（2026-10-12 从 2 改成 3）★
+ *     通道0 = ADC 电压(V)          —— 对方的波形
+ *     通道1 = 测到的对方频率(Hz)   —— Track_GetInFreq()
+ *     通道2 = 本机输出频率(Hz)     —— Signal_GetFreq()
+ *   通道1 和通道2 叠在一起看，跟频有没有跟上、差多少，一目了然。
+ *
+ *   每点字节数 = 4 × 本值 + 4（帧尾）  →  tx_buf = POINTS × 16
+ *   ⚠️ 改这个值必须同步复核 adc_vofa.c 里的 ADC_TX_BUF_LEN 和 adc_build_wave()
+ *      的单点字节数，以及 VOFA+ 里的「通道数」也要改成一样。 */
+#define ADC_VOFA_NCH_WAVE   3U
 
 /* 一窗希望覆盖几个信号周期（自适应降采样的目标值）。3~5 比较好看 */
 #define ADC_VOFA_CYCLES     4U
@@ -170,6 +181,15 @@ void Adc_Vofa_Poll(void);
   */
 uint16_t Adc_Vofa_Raw(uint32_t idx);
 
+/**
+  * @brief  取整块采样缓冲的首地址（直接指针，供 track.c 批量扫描用）
+  * @note   长度固定 ADC_BUF_LEN，元素 uint16_t，DMA 在后台循环改写它。
+  *         需要"新样本定位"时用 DMA 的 CNDTR：
+  *             写入位置 = ADC_BUF_LEN - __HAL_DMA_GET_COUNTER(hadc2.DMA_Handle)
+  *         ★ 别去写它 —— 这是 DMA 的目标缓冲。
+  */
+const uint16_t *Adc_Vofa_BufBase(void);
+
 /* ============================== 诊断计数（J-Link 可直接读）============================== */
 extern volatile uint32_t g_adc_frames;      /* 成功发出的帧数 */
 extern volatile uint32_t g_adc_busy;        /* 因上次未发完而跳过的帧数（波形流模式下应持续增长，正常） */
@@ -181,7 +201,7 @@ extern volatile uint32_t g_adc_max_raw;     /* 本窗最大值 */
 extern volatile uint32_t g_adc_decim;       /* 本帧实际用的降采样倍数 */
 extern volatile uint32_t g_adc_trig;        /* 本帧触发点下标（0xFFFFFFFF = 未触发） */
 extern volatile uint32_t g_adc_frame_len;   /* 本帧字节数 */
-extern volatile uint32_t g_adc_freq_hz;     /* 本帧按 Signal_GetFreq() 读到的频率(Hz) */
+extern volatile uint32_t g_adc_freq_hz;     /* 本帧用的频率(Hz)。跟频系统里 = 测到的对方频率 */
 
 #ifdef __cplusplus
 }
