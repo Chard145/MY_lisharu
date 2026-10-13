@@ -80,14 +80,19 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
 # Remove wrong libob.a library dependency when using cpp files
 list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 
-# Generate the exact image used by flash.jlink after EVERY successful link.
-# Do not create project.hex in the source root: that is not the flash input.
+# Generate the exact image used by the flash step after EVERY successful link.
+# Do not create project.hex in the source root: that is NOT the flash input.
+#
+# Only the HEX is generated here. The post-flash read-back verification parses
+# this same HEX and compares exactly the bytes it programs, so no intermediate
+# binary is needed. (An earlier attempt generated a --gap-fill binary instead:
+# that made objcopy size the output by a RAM section VMA and produced a ~400 MB
+# file, which is exactly the kind of silent mismatch this whole flow exists to
+# prevent. Parsing the HEX has no such failure mode.)
 add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_OBJCOPY} -O ihex $<TARGET_FILE:${CMAKE_PROJECT_NAME}>
             $<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>/project.hex
-    COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${CMAKE_PROJECT_NAME}>
-            $<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>/project.bin
-    COMMENT "Generating flash image and verification binary from linked ELF"
+    COMMENT "Generating the flash image from the linked ELF"
     VERBATIM
 )
 

@@ -138,13 +138,42 @@ TIM6 TRGO ──► DAC3 (DHR12R1, DMA1) ──► DAC3_OUT1
 | arm-gcc | `D:\AI_Models\ARM_GNU_Toolchain\arm-gnu-toolchain-15.2.rel1-mingw-w64-x86_64-arm-none-eabi\bin\` |
 | J-Link | `D:\MY_tool_at_ALL\J_Flash_APP\J-linkV9.64SEGGER\JLink_V964\` |
 
+### ★★★ 烧录只走这一条命令（不要手工拼步骤）★★★
+
 ```powershell
-cmake --build "C:\Users\chard\Desktop\MY_lisharu\project\build\Debug"
-# objcopy 转 hex，然后
-JLink.exe -CommanderScript flash.jlink
+powershell -ExecutionPolicy Bypass -File "C:\Users\chard\Desktop\MY_lisharu\project\Port\flash_verify.ps1"
 ```
 
-> **烧录前必须先关掉 RTT 桥** —— J-Link 独占。
+`flash_verify.ps1` 一次性做完，**并且自己证明结果**：
+
+1. 关掉 RTT 桥（J-Link 独占）
+2. `cmake --build` —— **hex 由 CMake 的 POST_BUILD 自动生成**，不用手工 objcopy
+3. **断言 `project.hex` 不比 `project.elf` 旧** —— 产物陈旧就直接拒绝烧录
+4. 烧录 `build\Debug\project.hex`（**唯一**会被烧的文件）
+5. **回读整片 flash，按 HEX 记录的地址逐字节比对**（只比镜像真正写了的字节，
+   记录之间的空隙不管——那里是擦除态 0xFF，没有意义）
+6. 打印 **PASS / FAIL**，并把 `时间 / 结论 / git commit / hex 哈希 / 字节数` 追加到
+   `Port\flash_log.txt`
+
+选项：`-SkipBuild`（不重编，直接烧现有产物）、`-KeepBridge`（不动 RTT 桥）。
+
+**为什么必须这样（2026-10-12 血泪，代价极大）**：
+以前是手工三步 —— `cmake --build` → 我自己敲 `objcopy ... project.hex`（**工程根目录**）
+→ `JLink loadfile`（读的是 **`build\Debug\project.hex`**）。两条路径**从来没被比对过**，
+而 objcopy 和 JLink 都返回 0，所以每一环都"成功"。结果**改了代码、编译通过、
+烧录报 O.K.，板上跑的却还是几小时前的旧固件**。
+
+它最坏的后果不是崩溃，是**污染结论**：拿新编译 ELF 的符号地址去解读旧固件的内存，
+读到的是别的变量，然后据此推理出一个自信但完全错误的结论
+（当时误判成"AWD 冻结"）。这比报错危险得多。
+
+**所以规则是**：
+- 烧录**一律**用 `flash_verify.ps1`，不再手工拼 objcopy/JLink。
+- **在看到 PASS 之前，任何"从目标机读符号地址得出的结论"都不成立。**
+- 工程根目录的 `project.hex` 已删除并作废，不要再生成（CMake 只写 `build\Debug\`）。
+
+> 仍然成立：**烧录前必须先关掉 RTT 桥** —— J-Link 独占。
+> 脚本已自动处理，手工烧录时才需要自己注意。
 
 ### RTT → VOFA+ 数据桥
 

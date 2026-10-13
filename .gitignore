@@ -65,3 +65,7 @@ __pycache__/
 
 # ---- 临时调试脚本（J-Link 读数/烧录用，随手建随手删，不进仓库）----
 _*.jlink
+
+# ---- 烧录审计日志（Port\flash_verify.ps1 每次追加一行，本机留存即可）----
+Port/flash_log.txt
+project/Port/flash_log.txt
