@@ -33,7 +33,8 @@
 [CmdletBinding()]
 param(
     [switch]$SkipBuild,     # flash the existing build without rebuilding
-    [switch]$KeepBridge     # do not stop the RTT bridge first
+    [switch]$KeepBridge,    # do not stop the RTT bridge first
+    [switch]$VerifyOnly     # do NOT flash: only read the chip back and compare
 )
 
 $ErrorActionPreference = 'Stop'
@@ -88,8 +89,13 @@ if (-not $KeepBridge) {
     }
 }
 
+$mode = if ($VerifyOnly) { 'VERIFY-ONLY' } else { 'FLASH' }
+Write-Host "[*] mode: $mode"
+
 # ---------------------------------------------------------------- 1) build
-if (-not $SkipBuild) {
+if ($VerifyOnly) {
+    Write-Host '[1] build skipped (-VerifyOnly: never re-flash, just compare)'
+} elseif (-not $SkipBuild) {
     Write-Host '[1] building ...'
     $env:PATH = "$gccBin;$ninjaBin;$env:PATH"
     & $cmakeExe --build $buildDir
@@ -190,15 +196,21 @@ $script += 'si SWD'
 $script += 'speed 4000'
 $script += 'device STM32G431C8'
 $script += 'connect'
-$script += 'erase'
-$script += ('loadfile "' + $hexPath + '"')
+if (-not $VerifyOnly) {
+    $script += 'erase'
+    $script += ('loadfile "' + $hexPath + '"')
+}
 $script += ('savebin "' + $readBack + '", ' + ('0x{0:X8}' -f $minAddr) + ', ' + ('0x{0:X}' -f $span))
 $script += 'r'
 $script += 'g'
 $script += 'qc'
 $script | Out-File -FilePath $jlinkScr -Encoding ascii
 
-Write-Host '[4] flashing + reading back ...'
+if ($VerifyOnly) {
+    Write-Host '[4] reading the chip back (no flashing) ...'
+} else {
+    Write-Host '[4] flashing + reading back ...'
+}
 $jout = & $jlinkExe -CommanderScript $jlinkScr 2>&1
 $jout | Out-File -FilePath (Join-Path $tmpDir 'jlink.log') -Encoding ascii
 
